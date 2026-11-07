@@ -1,0 +1,3 @@
+rootProject.name = "HushSpace"
+include ':HushCore'
+include ':app'

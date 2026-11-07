@@ -1,0 +1,15 @@
+package com.hush.env.android.hardware.location;
+
+import android.os.IBinder;
+import android.os.IInterface;
+import java.lang.reflect.Method;
+import com.hush.reflection.annotation.BClassNameNotProcess;
+import com.hush.reflection.annotation.BMethodCheckNotProcess;
+
+@BClassNameNotProcess("android.hardware.location.IContextHubService$Stub")
+public interface IContextHubServiceStubStatic {
+  @BMethodCheckNotProcess
+  Method _check_asInterface(IBinder iBinder);
+
+  IInterface asInterface(IBinder iBinder);
+}

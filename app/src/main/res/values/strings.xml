@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">hush 2.6.92</string>
+    <string name="app_subtitle">多开 · 隔离 · 分身</string>
+
+    <!-- 通用 -->
+    <string name="ok">确定</string>
+    <string name="cancel">取消</string>
+    <string name="delete">删除</string>
+    <string name="close">关闭</string>
+    <string name="loading">正在加载…</string>
+    <string name="search_hint">搜索应用</string>
+    <string name="retry">重试</string>
+
+    <!-- 启动页 -->
+    <string name="splash_tip">正在启动运行环境…</string>
+
+    <!-- 权限 -->
+    <string name="perm_title">开启必要权限</string>
+    <string name="perm_desc">hush 空间在独立目录中运行你选择的 App。全部数据默认存放在 App 专属外部目录，不需要任何存储权限。</string>
+    <string name="perm_storage">存储空间</string>
+    <string name="perm_storage_desc">可选。不授权也能正常使用，数据放在 Android/data/com.hush.space/files</string>
+    <string name="perm_install">安装应用</string>
+    <string name="perm_install_desc">允许把安装包安装到虚拟空间</string>
+    <string name="perm_notify">通知</string>
+    <string name="perm_notify_desc">用于显示应用运行状态</string>
+    <string name="perm_go">继续</string>
+    <string name="perm_skip">稍后再说</string>
+    <string name="perm_granted">已授权</string>
+
+    <!-- 主界面 -->
+    <string name="tab_cloned">我的应用</string>
+    <string name="tab_local">本机应用</string>
+    <string name="empty_cloned">还没有添加应用\n点击右下角按钮导入 APK</string>
+    <string name="empty_local">没有找到可克隆的应用</string>
+    <string name="empty_search">没有匹配的应用</string>
+    <string name="menu_space">空间管理</string>
+    <string name="menu_settings">设置</string>
+    <string name="menu_xposed">模块</string>
+    <string name="import_apk">导入 APK</string>
+    <string name="clone">克隆</string>
+    <string name="cloned">已克隆</string>
+    <string name="open">打开</string>
+    <string name="space_label">空间：%1$s</string>
+
+    <!-- 应用菜单 -->
+    <string name="act_launch">启动应用</string>
+    <string name="act_info">应用信息</string>
+    <string name="act_shortcut">创建桌面快捷方式</string>
+    <string name="act_stop">强制停止</string>
+    <string name="act_clear">清除数据</string>
+    <string name="act_uninstall">卸载</string>
+    <string name="confirm_uninstall">确定要从当前空间卸载「%1$s」吗？</string>
+    <string name="confirm_clear">清除「%1$s」的全部数据？此操作不可撤销。</string>
+    <string name="confirm_stop">强制停止「%1$s」？</string>
+    <string name="shortcut_done">已发送快捷方式请求</string>
+    <string name="shortcut_fail">创建快捷方式失败，请检查桌面权限</string>
+
+    <!-- 安装 -->
+    <string name="installing">正在安装…</string>
+    <string name="install_success">安装成功：%1$s</string>
+    <string name="install_fail">安装失败：%1$s</string>
+    <string name="install_invalid">这不是有效的 APK 文件</string>
+    <string name="not_installed">应用未安装</string>
+    <string name="launch_fail">启动失败，请确认应用已安装到当前空间</string>
+    <string name="uninstall_done">已卸载</string>
+    <string name="clear_done">数据已清除</string>
+    <string name="stop_done">已停止</string>
+
+    <!-- 应用信息 -->
+    <string name="info_title">应用信息</string>
+    <string name="info_package">包名</string>
+    <string name="info_version">版本</string>
+    <string name="info_size">大小</string>
+    <string name="info_space">所属空间</string>
+    <string name="info_target">目标 SDK</string>
+    <string name="info_path">安装路径</string>
+    <string name="info_state">运行状态</string>
+    <string name="state_running">运行中</string>
+    <string name="state_stopped">未运行</string>
+    <string name="copy_done">已复制到剪贴板</string>
+
+    <!-- 空间 -->
+    <string name="space_title">空间管理</string>
+    <string name="space_desc">每个空间拥有独立的存储、账号与运行环境，可并行运行同一个应用。</string>
+    <string name="space_current">当前空间</string>
+    <string name="space_switch">切换</string>
+    <string name="space_new">新建空间</string>
+    <string name="space_name_hint">空间名称</string>
+    <string name="space_created">空间已创建</string>
+    <string name="space_deleted">空间已删除</string>
+    <string name="space_delete_confirm">删除「%1$s」及其全部应用数据？</string>
+    <string name="space_cannot_delete">主空间不能删除</string>
+    <string name="space_apps_count">%1$d 个应用</string>
+    <string name="space_default_name">空间 %1$d</string>
+
+    <!-- 设置 -->
+    <string name="settings_title">设置</string>
+    <string name="settings_general">通用</string>
+    <string name="settings_env">环境伪装</string>
+    <string name="settings_env_desc">对空间内应用隐藏真实设备环境，提升兼容性</string>
+    <string name="settings_hide_root">隐藏 Root</string>
+    <string name="settings_hide_root_desc">对空间内应用隐藏 su 与 Magisk 痕迹</string>
+    <string name="settings_hide_xposed">隐藏 Xposed</string>
+    <string name="settings_hide_xposed_desc">隐藏模块框架痕迹</string>
+    <string name="settings_daemon">守护服务</string>
+    <string name="settings_daemon_desc">保持虚拟进程存活，减少被系统回收</string>
+    <string name="settings_appearance">外观</string>
+    <string name="settings_theme">主题</string>
+    <string name="settings_theme_system">跟随系统</string>
+    <string name="settings_theme_light">浅色</string>
+    <string name="settings_theme_dark">深色</string>
+    <string name="settings_about">关于</string>
+    <string name="settings_version">版本</string>
+    <string name="settings_engine">运行引擎</string>
+    <string name="settings_engine_value">HushCore 2.0</string>
+    <string name="settings_abi">架构</string>
+    <string name="settings_restart_tip">修改后需要重启应用生效</string>
+
+    <!-- 模块 -->
+    <string name="xposed_title">模块</string>
+    <string name="xposed_master">启用模块功能</string>
+    <string name="xposed_master_desc">为空间内应用加载 Xposed 模块</string>
+    <string name="xposed_import">导入模块</string>
+    <string name="xposed_empty">还没有安装模块\n点击右下角按钮导入模块 APK</string>
+    <string name="xposed_detected">检测到模块安装包</string>
+    <string name="xposed_detected_desc">这个安装包是一个 Xposed 模块，安装到模块空间后才能被空间内的应用加载。</string>
+    <string name="xposed_install_module">安装为模块</string>
+    <string name="xposed_install_app">安装为普通应用</string>
+    <string name="xposed_not_module">该 APK 不是 Xposed 模块</string>
+
+    <!-- 通知 -->
+    <string name="notif_channel">运行状态</string>
+    <string name="notif_title">hush 空间正在运行</string>
+
+    <!-- 设备伪装 -->
+    <string name="spoof_title">设备伪装</string>
+    <string name="spoof_desc">为当前空间内的应用提供独立的设备信息，降低多开检测风险。</string>
+    <string name="spoof_enable">启用设备伪装</string>
+    <string name="spoof_enable_desc">对空间内应用伪装机型、品牌与序列号</string>
+    <string name="spoof_brand">品牌</string>
+    <string name="spoof_model">机型</string>
+    <string name="spoof_manufacturer">厂商</string>
+    <string name="spoof_device">设备代号</string>
+    <string name="spoof_serial">序列号</string>
+    <string name="spoof_fingerprint">系统指纹</string>
+    <string name="spoof_save">保存并应用</string>
+    <string name="spoof_saved">已保存，重启空间内应用后生效</string>
+    <string name="spoof_preset">预设机型</string>
+    <string name="spoof_reset">恢复真实设备</string>
+    <string name="spoof_target">生效范围：%1$s</string>
+
+    <!-- 图标与名称 -->
+    <string name="act_change_icon">更换图标</string>
+    <string name="act_rename">重命名</string>
+    <string name="rename_hint">显示名称，留空恢复默认</string>
+    <string name="rename_reset">恢复默认</string>
+
+    <!-- 图标裁剪 -->
+    <string name="crop_title">裁剪图标</string>
+    <string name="crop_hint">双指缩放 · 单指拖动 · 双击放大</string>
+    <string name="crop_reset">复位</string>
+    <string name="crop_confirm">完成</string>
+    <string name="crop_load_fail">图片读取失败</string>
+    <string name="crop_saved">图标已更新</string>
+    <string name="crop_save_fail">图标保存失败</string>
+
+    <!-- 引导 -->
+    <string name="guide_title">欢迎使用 hush 空间</string>
+    <string name="guide_subtitle">为每个应用准备一份独立、干净、可伪装的运行环境</string>
+    <string name="guide_start">开始使用</string>
+    <string name="guide_skip">跳过</string>
+    <string name="guide_f1_title">独立多空间</string>
+    <string name="guide_f1_desc">同一应用可创建多个副本，各自独立数据，互不干扰</string>
+    <string name="guide_f2_title">设备伪装</string>
+    <string name="guide_f2_desc">按空间自定义机型、品牌与序列号，降低多开检测风险</string>
+    <string name="guide_f3_title">模块支持</string>
+    <string name="guide_f3_desc">内置 Xposed 模块加载能力，导入即用，逐应用控制</string>
+
+    <!-- 反馈 -->
+    <string name="feedback_title">反馈</string>
+    <string name="feedback_desc">描述你遇到的问题或想要的功能。内容只会保存在本机，由你决定发送给谁。</string>
+    <string name="feedback_hint">请尽量写清：哪个应用、做了什么操作、出现什么现象</string>
+    <string name="feedback_type_bug">问题</string>
+    <string name="feedback_type_feature">建议</string>
+    <string name="feedback_type_compat">兼容性</string>
+    <string name="feedback_type_other">其他</string>
+    <string name="feedback_attach_env">附带设备与应用信息</string>
+    <string name="feedback_copy">复制内容</string>
+    <string name="feedback_share">分享 / 发送</string>
+    <string name="feedback_share_fail">没有可用的分享应用</string>
+    <string name="feedback_empty">请先填写反馈内容</string>
+    <string name="feedback_mail_subject">hush 空间反馈</string>
+    <string name="settings_support">支持</string>
+    <string name="settings_feedback">反馈与建议</string>
+    <string name="settings_guide">功能引导</string>
+    <string name="settings_gms">Google 服务</string>
+    <string name="settings_gms_desc">为当前空间安装 GMS，供依赖 Google 登录的应用使用</string>
+    <string name="gms_installing">正在安装 Google 服务…</string>
+    <string name="gms_installed">Google 服务已就绪</string>
+    <string name="gms_removed">Google 服务已移除</string>
+    <string name="gms_fail">操作失败：%1$s</string>
+    <string name="gms_unsupported">当前设备不支持安装 GMS</string>
+</resources>

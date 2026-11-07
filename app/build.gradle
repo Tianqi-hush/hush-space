@@ -1,0 +1,113 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+// 签名配置从 local.properties 读取，仓库里不保存私钥（详见 README「构建前置条件」）。
+def localProps = new Properties()
+def localPropsFile = rootProject.file('local.properties')
+if (localPropsFile.exists()) {
+    localPropsFile.withInputStream { localProps.load(it) }
+}
+def signingReady = localProps.getProperty('storeFile') != null
+
+android {
+    namespace 'com.hush.space'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.hush.space"
+        minSdk 36
+        targetSdk 28
+        versionCode 212
+        versionName "2.6.92"
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+        vectorDrawables.useSupportLibrary = true
+    }
+
+    signingConfigs {
+        release {
+            if (signingReady) {
+                storeFile rootProject.file(localProps.getProperty('storeFile'))
+                storePassword localProps.getProperty('storePassword', '')
+                keyAlias localProps.getProperty('keyAlias', '')
+                keyPassword localProps.getProperty('keyPassword', '')
+                enableV1Signing true
+                enableV2Signing true
+                enableV3Signing true
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+            if (signingReady) signingConfig signingConfigs.release
+        }
+        release {
+            minifyEnabled false
+            shrinkResources false
+            if (signingReady) signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildFeatures {
+        viewBinding false
+        buildConfig true
+        compose true
+    }
+
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.5.14'
+    }
+
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+        // minSdk 提到 36 后 AGP 默认把 dex 以「不压缩」方式打包（支持直接 mmap），
+        // APK 会从 16MB 涨到 49MB。这里保持压缩，交付体积与旧版一致；
+        // 安装时 PackageManager 会解压并走正常的 dexopt，运行期没有差别。
+        dex {
+            useLegacyPackaging = true
+        }
+    }
+
+    lintOptions {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}
+
+dependencies {
+    implementation project(':HushCore')
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.core:core:1.12.0'
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'com.google.android.material:material:1.11.0'
+
+    // ---- Compose / Material 3 ----
+    implementation platform('androidx.compose:compose-bom:2024.06.00')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-graphics'
+    implementation 'androidx.compose.foundation:foundation'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.material:material-icons-extended'
+    implementation 'androidx.activity:activity-compose:1.9.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.8.2'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2'
+    debugImplementation 'androidx.compose.ui:ui-tooling'
+}

@@ -1,0 +1,19 @@
+*.iml
+.gradle/
+build/
+local.properties
+.idea/
+.DS_Store
+captures/
+
+# 签名私钥绝不入库
+keystore/
+*.jks
+*.keystore
+
+# 华为官方 APK 由使用者自行放入
+app/src/main/assets/hms/*.apk
+app/src/main/assets/hms/kits/*.apk
+
+# NDK 中间产物
+HushCore/src/main/cpp/obj/

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">#C3BFFF</color>
+    <color name="on_primary">#23127B</color>
+    <color name="primary_container">#3A2E9E</color>
+    <color name="on_primary_container">#E3DEFF</color>
+
+    <color name="secondary">#C5C3DD</color>
+    <color name="on_secondary">#2E2E43</color>
+    <color name="secondary_container">#45455B</color>
+    <color name="on_secondary_container">#E1DFF9</color>
+
+    <color name="tertiary">#80D5D6</color>
+    <color name="on_tertiary">#003737</color>
+    <color name="tertiary_container">#004F50</color>
+    <color name="on_tertiary_container">#9CF1F2</color>
+
+    <color name="error">#F2B8B5</color>
+    <color name="on_error">#601410</color>
+    <color name="error_container">#8C1D18</color>
+    <color name="on_error_container">#F9DEDC</color>
+
+    <color name="surface">#131218</color>
+    <color name="on_surface">#E5E1E9</color>
+    <color name="surface_variant">#47464F</color>
+    <color name="on_surface_variant">#C8C5D0</color>
+    <color name="surface_container">#1F1E24</color>
+    <color name="surface_container_high">#292830</color>
+    <color name="outline">#928F99</color>
+    <color name="outline_variant">#47464F</color>
+
+    <color name="splash_top">#0B0A16</color>
+    <color name="splash_bottom">#2B1B6B</color>
+    <color name="scrim">#99000000</color>
+
+    <color name="ic_launcher_background">#3B2E9E</color>
+</resources>

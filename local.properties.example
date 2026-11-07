@@ -1,0 +1,7 @@
+sdk.dir=/path/to/android-sdk
+
+# 可选：签名配置（不填则产物为未签名 APK）
+# storeFile=keystore/hush.jks
+# storePassword=your-password
+# keyAlias=hush
+# keyPassword=your-password

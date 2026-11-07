@@ -1,0 +1,1344 @@
+内置 HMS Core 说明
+==================
+
+本源码包为了控制体积，没有包含 assets 下的两个 APK（共约 66MB）：
+  app/src/main/assets/hms/hmscore.apk                   约 54MB
+  app/src/main/assets/hms/kits/AccountKit-base.apk      约 9.5MB
+
+要恢复完整可构建状态：
+1. 新建目录 app/src/main/assets/hms/ 和 app/src/main/assets/hms/kits/
+2. 放入官方 HMS Core APK，重命名为 hmscore.apk
+3. 从 hmscore.apk 里取出账号 kit：
+     unzip -j assets/hms/hmscore.apk assets/kits/AccountKit-base.apk \
+       -d app/src/main/assets/hms/kits/
+
+HMS Core 本体：
+  包名      com.huawei.hwid
+  版本      6.16.4.362
+  versionCode 61604362
+  MD5       b9ee947aae0f3f2c945b5a254dd4aea2
+  大小      56,701,278 字节
+  签名      CN=China, OU=Huawei, O=Huawei, L=Shenzhen, ST=Shenzhen, C=CN
+            SHA-256 e49d5c2c0e11b3b1b96ca56c6de2a14ec7dab5ccc3b5f300d03e5b4dba44f539
+
+账号 kit（华为账号登录界面，必须和本体一起内置）：
+  包名      com.huawei.hms.account
+  版本      6.22.0.301
+  versionCode 62200301
+  MD5       f55f1426bcfd433ee83e13782b8321bb
+  大小      9,549,431 字节
+
+为什么必须带 kit
+----------------
+HMS Core 6.16 把账号界面拆成了独立 APK，启动时先问
+FeatureInstallManager.getAllInstalledModules() 里有没有 HwID_Features：
+  - 有 → 直接进账号界面；
+  - 没有 → 从 assets 解压 kit，再走 PackageInstaller 安装。
+容器里没有 INSTALL_PACKAGES 权限，第二步必然失败（日志：
+FeaturesLoadingActivity installFail errorcode:2），表现就是登录页一直转圈。
+
+2.6.12 起做了两层兜底：
+1. 给 com.huawei.hwid 的 ApplicationInfo.metaData 注入
+   com.android.dynamic.apk.fused.modules=HwID_Features，
+   让 getAllInstalledModules() 直接认「已装」，跳过安装；
+2. 安装 HMS Core 时把 AccountKit-base.apk 一并装进空间，
+   老版本空间在宿主启动时后台补装。
+
+2.6.13 起补上「调用方包名」：
+HMS 的 ForegroundBus 会拿 Activity.getCallingPackage() 跟请求里的
+cpPackageName 比对，不一致直接返回 907135000，账号页弹「无法获取数据」。
+容器里所有 guest 都跑在宿主进程里，系统只会把 launchedFromPackage 填成
+com.hush.space，所以容器在 guest 调 startActivity 时记下真实虚拟包名，
+Activity 创建前写回 ActivityClientRecord.launchedFromPackage。
+日志确认点：diag.log 里出现
+  caller: launchedFromPackage=com.huawei.appmarket
+
+2.6.14 起把调用方包名改到 Instrumentation：
+Android 12+ 的 LaunchActivityItem 在 ActivityClientRecord 建好之前就执行，
+上一版在 EXECUTE_TRANSACTION 里改 record 拿不到（日志：record 未找到）。
+现在在 AppInstrumentation.callActivityOnCreate 之前写 Activity 的
+mLaunchedFromPackage 字段，onCreate 里 getCallingPackage() 就能拿到正确值。
+
+2.6.15 修「HMS 每秒崩一次」：
+HMS 的 kit 容器服务（IKitContainerServiceManager）跨进程调用时，
+服务端用 AttributionSource.enforceCallingUid() 校验「声明 uid == 调用 uid」。
+容器里所有 guest 共用宿主真实 Linux uid（10442），但 ContextCompat.fix()
+把 app Context 的 attribution uid 写成了虚拟 uid（10001），于是每次都抛
+  SecurityException: Calling uid: 10442 doesn't match source uid: 10001
+:core 进程起来即死，账号、应用市场、游戏全调用不到 HMS。
+现在 attribution uid 统一用宿主真实 uid，和包名（宿主包名）、Binder 内核 uid
+三者一致。同版本还修了两处：
+  - 没有 LAUNCHER activity 的包（HMS Core / 账号 kit）在首次绑定进程时
+    会把 null 存进 stub intent，下一轮 LaunchActivityItem.hashCode()
+    对 null mIntent 抛 NPE 打死进程 —— 现在用当前 intent 兜底；
+  - getPackageInfo(pkg, GET_ACTIVITIES) 生成失败时不再返回 null
+    （HMS 自检会当成「没装」），去掉组件数组再生成一次，并记录真实异常。
+
+缺少这两个文件时应用仍可正常编译运行，只是设置页的「华为 HMS Core」
+开关会提示「内置安装包缺失」。
+
+2.6.16 修「账号 kit 进程起不来 / 调用方仍然对不上」：
+1. AccountKit-base.apk 的清单里 <application android:name=
+   "com.huawei.hwid.common.app.HwIDApplication">，这个类在 hmscore.apk
+   里，不在 kit 自己的 dex 里。kit 被当成独立包安装后，进程一起来
+   LoadedApk 就 ClassNotFoundException -> Unable to instantiate
+   application，com.huawei.hms.account.core 永远起不来。
+   现在给 kit 包的 ApplicationInfo.className 统一换成 android.app.Application。
+2. 真机上 HMS Core 与账号 kit 是同一个 APK 的 base + split，共用一个
+   ClassLoader；容器里它们是两个独立包。kit 里的 HwIDProvider 静态初始化
+   要 com.huawei.hms.support.log.KitLog（只在 hmscore.apk 里），所以
+   Provider 装不上、账号服务拿不到数据。现在绑定进程时用
+   BaseDexClassLoader.addDexPath() 把对方的 base.apk 追加进当前 ClassLoader，
+   双向补齐（hwid ↔ com.huawei.hms.*）。
+3. 调用方包名不再依赖 Activity.mLaunchedFromPackage（Android 17 上这个
+   字段已经不存在，日志：NoSuchFieldException）。改成：
+    - 事务执行前直接写 LaunchActivityItem 的 launchedFromPackage；
+    - 同时按「值等于宿主包名」扫描 LaunchActivityItem / ActivityInfo /
+      Activity 的 String 字段并替换，ROM 改字段名也能命中；
+    - onCreate 前回读 getCallingPackage() 写日志确认。
+4. PackageInfo 生成时单个组件解析失败只跳过该组件，不再整包返回 null
+   （HMS 自检会当成没装）。
+5. HMS Core / 账号 kit 不再套用「连续崩溃就按加固壳跑 ART hook」的重试，
+   也不再加载 Xposed 模块 —— 这两件事都会改账号 SDK 内部方法。
+
+2.6.17 修「调用方包名怎么改都还是 com.hush.space」：
+这次从 HMS 日志里把链路彻底对上了 —— Android 17（SDK 37）的
+Activity.getCallingPackage() 已经不走 ActivityTaskManager 了，而是
+
+    Activity.getCallingPackage()
+      -> ActivityClient.getInstance().getCallingPackage(mToken)
+        -> IActivityClientController.getCallingPackage(token)   // Binder
+
+Activity 里既没有 mLaunchedFromPackage 字段（2.6.14 的 NoSuchFieldException），
+ActivityClientRecord 里也没有这个字段了，全被挪到 system_server 的
+ActivityRecord 里，客户端只有拿 token 去问这一条路。所以之前写字段、
+写 LaunchActivityItem、hook ATM 的 getLaunchedFromPackage 全都读不到。
+
+现在在 guest 进程里把 IActivityClientController 换成动态代理：
+- 只拦 getCallingPackage / getLaunchedFromPackage；
+- token 命中「启动时记录的虚拟调用方」就返回它，其余方法原样透传；
+- 两条安装路径：hook IActivityTaskManager.getActivityClientController()，
+  以及直接 ActivityClient.setActivityClientController(proxy) 预置缓存，
+  防止被 ActivityThread 重新取服务时覆盖；
+- token 对不上（PendingIntent / 系统转发）时，3 秒内最近一次记录的调用方兜底。
+
+日志里应该看到：
+  caller: ActivityClient 控制器已接管
+  caller: getCallingPackage -> com.huawei.appmarket token=...
+HMS 自己那行会变成：
+  StartUpGuideLoginActivity: onCreate mCallingPackageName = com.huawei.appmarket
+
+2.6.18 修「调用方能过、但登录还是失败 / HMS Core 点不开」：
+1. 2.6.17 的 ActivityClient 控制器接管生效了 —— 2.6.18 前的日志里
+   Different calling package / 907135000 已经消失，卡点后移了一层：
+     ForegroundBus: Failed to get resolveInfo
+     ForegroundBus: errorReturn code:907135001,
+                    msg:action configure is invalid:com.huawei.hms.hwidjos.signIn
+   HMS 的 RuleEngine 会把 com.huawei.hms.account.signIn 改写成
+   com.huawei.hms.hwidjos.signIn（游戏/渠道包走这条），而这条 action
+   只声明在 GameServiceKit.apk 里（kit 名 hwidjos，包名
+   com.huawei.hms.game）。之前只内置了 AccountKit，所以游戏登录必然失败。
+   现在 GameServiceKit.apk 一起内置、一起装进空间；补装后重启 HMS Core
+   进程（它只在启动时扫一遍 kit，不重启就永远看不到新装的 hwidjos）。
+2. HMS Core 6.16 的清单里没有 LAUNCHER activity（真机上它是从「设置 →
+   华为账号」进的，没有桌面图标）。容器里点图标走
+   getLaunchIntentForPackage，以前直接返回 null → 点了没反应。
+   现在给一个入口：账号 kit 的 StartUpGuideLoginActivity，
+   并把调用方写成 com.huawei.hwid（从 HMS 自己进去的语义）。
+3. kit 包的 Application 一律退化成 android.app.Application。
+   GameServiceKit 的 JosApplication 虽然在自己的 dex 里，但真机上它是
+   split、跟 CoreApplication 同进程；容器里当独立包跑会缺上下文。
+4. fused.modules（HwID_Features）除了给 com.huawei.hwid 补，也给 kit 包补。
+   日志里 FeatureManager: featrues:[] 说明它读的是 kit 自己那份。
+
+2.6.19 修「2.6.18 装了 GameServiceKit 还是 907135001」+ 日志丢失：
+1. 2.6.18 给所有 kit 包注入的 fused module 名一律是 HwID_Features，
+   这是错的。FeatureInfoManager 的判定是
+     fused.modules.split(",") + PackageInfo.splitNames
+     -> 去掉 config.*
+     -> 调用方拿 kit_name.split(";") 做 containsAll
+   game kit 的 kit_name 是 core;game;payjos;hwidjos;iapjos;jos，
+   必须逐字出现这些名字才算「已装」。现在按包分别注入：
+     com.huawei.hwid        -> HwID_Features
+     com.huawei.hms.account -> hwid,account
+     com.huawei.hms.game    -> core,game,payjos,hwidjos,iapjos,jos
+   名字对不上时 FeatureManager 不会调用 HwidJosMainEntry.onCreated，
+   hwidjos.signIn 就一直没注册，游戏登录固定报 907135001。
+2. HMS Core 把 kit 列表读进内存后不再刷新。升级到本版后第一次启动，
+   无条件杀一次 com.huawei.hwid + com.huawei.hms.account 两个进程，
+   强制下次拉起时重扫（每个宿主进程只做一次）。
+3. 日志丢失：2.6.15 之后拿回来的 diag.log 一直停在 2.6.14。
+   - guest 进程 Diag.init 时 HushCore.getContext() 可能还是 null，
+     以前直接 return，整个进程一行都不写；现在退回反射再取一次。
+   - 路径统一成宿主包名拼的 Android/data/com.hush.space/files/diag.log，
+     guest 不再写自己那个包的目录（那个目录导出时根本没人翻）。
+   - 轮转阈值 4MB -> 16MB，避免用户只拷 diag.log、内容却在 .prev 里。
+4. 打开 HMS Core 图标的日志改成进 diag（pm: HMS 无 launcher，入口=...）。
+
+2.6.20 修「点 HMS 图标进去 1-2 秒闪退」：
+2.6.18/2.6.19 把入口指向账号 kit 的 StartUpGuideLoginActivity，
+那是「登录引导页」——从 HMS 自己进来时它判断不需要引导就直接
+finish，表现出来的就是界面闪一下就没了。
+改回真机上「设置 → 华为账号」的那个页面：
+  com.huawei.hwid.cloudsettings.ui.HuaweiIDForSettingsActivity
+（hmscore 本体，进程 com.huawei.hwid.container2，清单里声明了
+ com.android.settings.action.IA_SETTINGS），调用方仍然写
+com.huawei.hwid，保证 ForegroundBus 校验能过。
+
+2.6.21 修「打开 HMS 界面 1-2 秒后闪退」的真正原因：
+和入口页面无关。2.6.20 的 diag.log 里能看到完整的作案时间线：
+  09:07:33.017  点图标，拉起 com.huawei.hwid.container2
+  09:07:33.441  [com.hush.space] hms: 重启 HMS 进程（升级后重扫 kit）
+  09:07:33.442  [com.hush.space] hms: 启动补装账号 kit uid=0 -> true
+  09:07:34.x    hwid 各进程重新绑定，账号页起来
+宿主冷启动 3 秒后，后台补装线程跑 ensureKits()，判定本版本还没
+「重扫」过，于是调 restartHms() 把 com.huawei.hwid + com.huawei.hms.account
+全杀了——正好落在用户点开华为账号的那两秒里，界面当然一闪就没，
+而且日志里一条异常都没有（不是崩溃，是被自己人 kill 的）。
+改动：
+1. restartHms() 先查 BProcessManagerService 里 HMS / 账号 kit 还有没有
+   活着的 pid。有就跳过，只写一行
+     hms: HMS 进程存活，跳过重启（...），kit 下次冷启动生效
+   kit 已经落盘，HMS 下次冷启动 CoreApplication 必然重新扫到，没必要
+   为一份内存里的 kit 列表打断正在进行的登录。
+2. ensureHmsKitsAsync() 只在宿主主进程跑。SpaceApplication 在每个
+   com.hush.space:pN 里都会 onCreate，以前 8 个进程各解析一遍 9.5MB 的
+   kit 包，也让「补装即重启」在任何时刻都可能触发。进程名读不到时保持
+   旧行为，宁可多跑一次也不漏装。
+
+2.6.21 修 com.huawei.hwid.persistent 起不来（CoreApplication 崩）：
+2.6.20 日志：
+  bind: handleBindApplication FAILED at start
+  Caused by: Can't create handler inside thread Thread[binder:32130_3]
+             that has not called Looper.prepare()
+    at com.huawei.hms.app.CoreApplication.attachBaseContext(CoreApplication.java:188)
+com.huawei.hwid.persistent 是被 provider 拉起的，绑定入口在
+IBActivityThread.acquireContentProviderClient，跑在 binder 线程池里。
+HMS 的 CoreApplication.attachBaseContext 第一件事就是 new Handler()，
+binder 线程没有 Looper 直接抛，Application 建不出来，进程废掉。
+改动：handleBindApplication 里 makeApplication / Application.onCreate
+两步统一走 callOnGuestMain()：当前线程是主线程就原地执行（老路径不变），
+是 binder 线程就 post 到主线程并同步等结果；主线程 6 秒没响应（还没进
+Looper.loop 的极端情况）就回退到本线程并补一个 Looper，任务带 CAS 保护，
+不会出现两个 Application 实例。
+
+2.6.21 新增诊断：
+AppInstrumentation 记录 Activity 的 create/resume/pause/destroy，
+带真实类名和 intent（act: create com.xxx.Yyy cmp=... act=...）。
+HMS 的 kit 有一层 runtimekit 代理（清单里是
+com.huawei.hms.runtimekit.stubexplicit.*，运行时才换成 kit 里的真实类），
+以后再遇到「闪退」，看 act 行就能分清是代理没换成还是真实类自己 finish。
+
+2.6.23 分析 2.6.22 日志：华为应用市场登录卡在「正在登录…」
+这次用户测的是应用市场，链路和光遇不同：
+  09:49:41.314  BridgeActivity(appmarket) pause
+  09:49:41.318  AccountSignInHubActivity(appmarket) create/resume，49ms 后 pause
+  09:49:41.374  BridgeActivity(appmarket) create/resume，15ms 后 pause
+  09:49:41.410  UiJumpActivity(hwid) create/resume
+  09:49:41.431  UiJumpActivity 调 getCallingPackage -> com.huawei.appmarket
+  09:49:41.439  UiJumpActivity pause
+  09:49:41.443  ActivityResultItem 回到 appmarket
+  09:49:41.460/472/485  三层依次 destroy finishing=true
+  09:49:52.385  appmarket 放弃，界面停在「正在登录…」
+UiJumpActivity 是 1x1 透明的跳板页，正常行为是：onCreate 里按
+intent.extra.hms.core.DELEGATE_NAME 找到 delegate（名字是
+com.huawei.hms.core.activity.ForegroundBus，真实类 com.huawei.hms.core.activity.b），
+交给它去请求 hwid.core 的 HMSCoreService 拉起真正的账号页。
+反编译确认 e() 只在两种情况下返回 false 并 setResult(1)+finish：
+  a) DELEGATE_NAME 为空；
+  b) delegate 类 newInstance 失败。
+两种情况都属于「参数没到」或「单例没初始化」，而这两种正好都是拆包容器
+最容易出的问题。以前日志里只有 cmp/act/flags，看不到 extras，无法判定。
+
+2.6.23 新增诊断（都是纯日志，不改行为）：
+1. act: <阶段> <类名> cmp=... act=... flags=... extras={k=v, ...}
+   intent 的 extras 全部摊平，Bundle/Intent 只打 key 和组件。
+2. act: start from=<发起方> req=<requestCode> cmp=... act=... extras=...
+   每次 startActivity（限华为系包）记下发起方和参数，能看出参数在哪一跳丢的。
+3. act: post-create <类名> finishing=true/false
+   onCreate 一返回就看是不是已经准备退出，true 的还带上当时的栈。
+4. svc: bindService -> true/false <包名>
+   svc: onServiceConnected <组件> binder=true/false dead=false
+   绑定到底成没成、服务有没有连上，以前只有一行 bindService 请求，没有结果。
+
+2.6.23 顺带缩短 HMS 冷启动等待：
+2.6.22 日志里 com.huawei.hwid.core 从 09:49:33.327 起来，到 09:49:46.398
+才完成 Application 绑定，用了 13 秒；其中 p6 打了
+  bind: Application.onCreate 主线程 6s 未执行，回退当前线程
+这条等待是 2.6.21 为 binder 线程绑定 Application 加的兜底，超时值 6 秒太长，
+刚好把 UiJumpActivity 的请求拖到服务未就绪的时候。改成 1.2 秒——主线程正常
+几十毫秒就进 Looper，1.2 秒足够，真等到 1.2 秒说明主线程确实没起来，回退
+本线程补 Looper 也不会更差。
+
+2.6.23 追加：跳板页自检
+UiJumpActivity 起来时会先跑一遍「同样的查找」并把结果打出来：
+  act: probe UiJump delegateName='...' center=true instance=com.huawei.hms.core.activity.b
+如果 delegateName 是 <null>，就是参数没传过来；如果是 instance=NULL，
+后面会跟一段异常栈，直接告诉我们 ForegroundBus 为什么建不起来。
+
+2.6.24 找到「点开 HMS Core 一秒退回桌面」的真正原因：七个基础框架 kit 从来没装过。
+
+证据（2.6.23 日志，三条独立线索指向同一件事）：
+1. 直接报错：
+   Caused by: java.lang.ClassNotFoundException:
+     Didn't find class "com.huawei.hwid.fingerprint.provider.HwIDFileProvider"
+     on path: DexPathList[[account/base.apk, hwid/base.apk]]
+   Suppressed: java.lang.NoClassDefFoundError:
+     Failed resolution of: Lcom/huawei/hms/runtimekit/container/kitsdk/KitFileProvider;
+   KitFileProvider 在 Framework-runtime.apk 里，没装 → 父类解析不了 → provider 全废。
+2. HMS 主动去找，全部返回 null：
+   pm: getPackageInfo pkg=com.huawei.hms.commonkit -> null
+   pm: getPackageInfo pkg=com.huawei.hms.kitstore   -> null
+3. 登录链路那个跳板页
+   com.huawei.hms.runtimekit.stub.HMSKitStandardC2NEStubActivity1
+   的类只在 Framework-runtime.apk 的 dex 里。反编译确认：
+     只有 Framework-runtime 命中 HMSKitStandardC2NEStubActivity1；
+     hmscore / AccountKit / GameServiceKit 三个包全部未命中。
+   所以跳板页起来的是个空壳，onCreate 里没东西可做，立刻 finish，
+   整条 Activity 栈跟着退掉 —— 用户看到的就是「进界面 1-2 秒闪退」，
+   而且没有异常（finish 是正常调用，不是崩溃）。
+
+依据是 hmscore.apk 自带的 assets/raw/kits_config.json，里面有一份
+priority_install：
+   Framework-common, Framework-manager, Framework-runtime, Framework-ui,
+   Framework-privacy, Framework-kitstore, Framework-webapp
+真机上这七个是 HMS Core 安装完自己从 assets 解压装的。容器里 kit 是我们
+手工装的，只装了 AccountKit + GameServiceKit，这七个一个都没有。
+
+2.6.24 改动：
+1. 内置七个 Framework kit（从 hmscore.apk 的 assets/kits/ 原样取出）：
+     com.huawei.hms.commonkit   Framework-common.apk    fwcom-grs,fwcom-util,measurement,apptouch
+     com.huawei.hms.fwkit       Framework-manager.apk   kpms,kams
+     com.huawei.hms.runtimekit  Framework-runtime.apk   runtime
+     com.huawei.hms.fwui        Framework-ui.apk        fwui
+     com.huawei.hms.privacy     Framework-privacy.apk   privacykit
+     com.huawei.hms.kitstore    Framework-kitstore.apk  kitstore
+     com.huawei.hms.webapp      Framework-webapp.apk    webapp-runtime
+   模块名严格照 kits_config.json 的 kit_name 写：FeatureInfoManager 用
+   containsAll 判定，少一个、拼错一个就认为没装。
+2. ClassLoader 串联改成「全部 HMS 系包共用一份 dex 列表」。
+   以前只做了 hwid ↔ AccountKit 的互相补，runtimekit 的类进不来。
+   真机上一个 APK 的 base+split 本来共用一个 ClassLoader，现在容器里
+   九个包也串成一条，顺序上 HMS 本体排第一，避免 kit 里的旧类盖掉本体。
+3. 升级时强制重装全部 kit。以前 isKitInstalled 只看包在不在、不看版本，
+   用户从旧版本一路升上来，账号 kit 还是两三个版本前的旧包（这就是
+   HwIDFileProvider 明明在 assets 里有、容器里却 ClassNotFound 的原因）。
+   现在 KIT_REV 一变就卸载重装，assets 里是什么，容器里就是什么。
+   重装标记改成「装成功才写」，失败下次还会重试。
+4. 点 HMS Core / 应用市场的图标时，先同步把 kit 补齐再拉起。
+   以前是后台慢慢装，用户同一时刻点开账号页，跳板页当然找不到类。
+   第一次点会多等十几秒（要装七个包），之后就秒开。
+
+2.6.25 找到「HMS Core 进去 1-2 秒闪退」的最后一环：九个包各有一个 ClassLoader，
+静态单例被复制了九份。
+
+2.6.24 的日志先确认了一件事：kit 这次真的装进去了。
+  10:33:51.910  hms: kit 安装 com.huawei.hms.account      -> true
+  10:33:51.950  hms: kit 安装 com.huawei.hms.game         -> true
+  10:33:51.969  hms: kit 安装 com.huawei.hms.commonkit    -> true
+  10:33:51.984  hms: kit 安装 com.huawei.hms.fwkit        -> true
+  10:33:51.999  hms: kit 安装 com.huawei.hms.runtimekit   -> true
+  10:33:52.022  hms: kit 安装 com.huawei.hms.fwui         -> true
+  10:33:52.038  hms: kit 安装 com.huawei.hms.privacy      -> true
+  10:33:52.059  hms: kit 安装 com.huawei.hms.kitstore     -> true
+  10:33:52.068  hms: kit 安装 com.huawei.hms.webapp       -> true
+九个全 true，pm: fused 的模块名也全对。所以不是缺类了。
+
+但界面还是退，这次抓到了准确的死法：
+  10:33:57.305  act: start from=HMSKitStandardC2NEStubActivity1
+                act=611cde43...:com.huawei.hwid.container2
+                extras={... transID=5f36d598..., carrierDataKey=CarrierData ...}
+  10:33:57.325  act: create HMSKitStandardC2NEStubActivity1
+  10:33:57.438  act: post-create HMSKitStandardC2NEStubActivity1 finishing=true
+                java.lang.Throwable: finish-in-onCreate
+60 毫秒，onCreate 里自己 finish，没有异常。
+
+反编译 Framework-runtime 的 ContainerActivity 确认了判定条件：
+  loadKitForActivity()
+    -> loadKitInfoSuccess(intent)
+         -> RuntimeActivityThread.getInstance().getActivityManager()
+              .verifySession(intent.getAction(), intent.getComponent())
+         返回 null 就
+         "private stub verify session OR explict stub load kit failed!" -> false
+    -> false 时 finishWithTryCatch()
+
+也就是说：session 验证失败。session id 就是 Intent 的 action
+（611cde4313c76533edc73a8a5791a67b24378b8df47bfd61:com.huawei.hwid.container2），
+由发起方在 RuntimeActivityThread / kams 里注册，跳板页拿它去查 kit 信息。
+
+第一次跳板页是成功的（10:33:55.874，action a4187cb5...，post-create finishing=false，
+resume 时 cmp 已经换成 com.huawei.hms.account/...OneKeyLoginOrRegisterActivity）。
+第二次失败，两次的差别只有一个：
+  第一次发起方是 hwid 的 stubexplicit.HwIDStartUpGuideLoginActivity（hwid 的类加载器）
+  第二次发起方是 OneKeyLoginOrRegisterActivity 的代码（account 的类加载器）
+发起方在自己的那份 kams 里注册 session，跳板页在 hwid 的那份里查 —— 查不到。
+
+根因：真机上 HMS Core 是一个 APK，base + 所有 split 共用同一个 ClassLoader，
+RuntimeActivityThread、KitLoaderManager、kams 这些单例只有一份。容器里被拆成
+九个独立安装的包，每个包各 new 一个 PathClassLoader，即使 dex 路径已经串成
+一条（2.6.24 做的），静态字段仍然是九份，单例也就有九份。
+
+2.6.25 改动：
+createPackageContext() 里让所有 HMS 系包（com.huawei.hwid + com.huawei.hms.*）
+共用同一个 ClassLoader 实例：第一个包正常建，把九份 dex 全加进去；
+后面八个包直接把自己的 LoadedApk.mClassLoader 换成这个实例。
+字段名不写死，按「类型是 ClassLoader 且当前值等于刚建好的 loader」找，
+个别 ROM 改过名字也能命中。
+
+顺带的效果：RuntimeActivityThread、KitLoaderManager、ModuleLoader 的 kit 缓存、
+各种 Manager 单例全部回到一份，跟真机一致。以后不用再为「单例分裂」单独打补丁。
+
+日志里会出现（三选一）：
+  bind: HMS 共用 ClassLoader 建立  com.huawei.hwid ...
+  bind: HMS 共用 ClassLoader 替换  com.huawei.hms.account ...
+  bind: HMS 共用 ClassLoader 复用  com.huawei.hms.runtimekit ...
+
+2.6.26 修「应用列表里一堆花花绿绿的 HMS 组件」：
+2.6.24 把七个 Framework kit 装进空间后，AppRepo.loadCloned() 把它们当成
+普通应用列了出来。用户看到的「我的应用」变成：
+  光·遇 / 华为应用市场 / 华为帐号 / privacy / webapp / common-kit /
+  framework-runtime / framework-ui / fwkit / kitstore / HMS Core / hmsGame
+一排默认机器人图标，点进去还都是空白页。真机上这些是 HMS Core 的 split，
+桌面永远看不到。
+改动：AppRepo.loadCloned() 跳过所有 com.huawei.hms.*（
+HmsCore.isInternalKit）。只隐藏、不卸载——账号页、跳板页、kit 路由全靠它们。
+列表里保留：光·遇、华为应用市场、华为帐号。
+
+2.6.26 修 UiJumpActivity / runtimekit 跳板页「起来就 finish」：
+2.6.25 日志里两条链路都倒在同一件事上——跳板页比服务就绪早了一两百毫秒。
+  A. 华为账号登录：
+     10:54:30.235  跳板页 create（action 5211ad18…）
+     10:54:30.281  finishing=true（verifySession 返回 null）
+     10:54:30.418  hwid.core 才 bindService HMSKitCoreNewService
+     10:54:30.420  onServiceConnected
+     跳板页比服务早了 180ms，kams 里还没有 session，当然查不到。
+  B. 应用市场登录：
+     10:54:35.093  UiJumpActivity create
+     10:54:35.095  probe delegateName 正常，delegate 实例也建出来了
+     10:54:35.155  destroy finishing=true（62ms，同样没有异常）
+     UiJumpActivity 把请求交给 ForegroundBus 后是异步等回包，
+     服务端没就绪就直接回调错误、关页面。
+真机上 hwid.core 常驻，这两个服务一直在，不存在这个空档；容器里是临时拉起。
+改动：
+1. 跳板页进 onCreate 之前等 400ms（AppInstrumentation.awaitRuntimekitReady）。
+   只对 com.huawei.hms.runtimekit.stub.* 和 core.activity.UiJumpActivity 生效，
+   其它 Activity 一秒都不多等。
+2. 万一 400ms 还不够，RuntimekitGuard 再兜一次：拦下 runtimekit 跳板页的
+   第一次 finishActivity，350ms 后反射重跑 ContainerActivity.loadKitForActivity
+   (Bundle)。这次服务一定在了，查到 session 就正常拉起真实页面；再失败才
+   真的放行 finish。每个跳板页只重试一次，不会死循环。
+3. 日志新增：
+     act: stub 等 kams 就绪 <类名> cost=400ms
+     act: stub 首次 finish 被拦下，350ms 后重试
+     act: stub 重试 loadKitForActivity -> true/false
+
+== 2.6.27 ==
+2.6.26 日志（第一次有实质推进）：
+  11:03:48.051  HMSKitStandardC2NEStubActivity1 create（session fddaec…）
+  11:03:48.452  等 400ms
+  11:03:48.498  post-create finishing=false，resume
+  11:03:49.243  跳板页自己 startActivity 拉起下一个跳板页（session 0816…）
+  11:03:49.772  第二个跳板页 post-create finishing=true，50ms 内自己退
+说明：第一跳已经能过 verifySession，卡在第二跳；而第二跳的 session 是
+kams 现场生成的，容器里 delegate/KitLoaderManager 单例和生成方不在同一进程，
+注入失败，页面直接 finish。
+结论：只要还在用「跳板页 + 动态注入 ClassLoader」这条路，就永远在跟
+kams 的进程/单例状态赛跑，修不完。
+改动（换路，不再修跳板页）：
+1. 新增 StubLauncher：跳板页 onCreate 之前，自己反射调
+   ContainerActivity.loadKitInfoSuccess(intent)，拿到 session Bundle。
+   Bundle 里有 kit_component_name —— 目标页面真实的 ComponentName。
+2. 直接 new Intent(原 intent).setComponent(kit_component_name) + startActivity，
+   带 FLAG_ACTIVITY_FORWARD_RESULT（登录结果要回传给最初调用方），
+   然后 finish 跳板页，全程不碰 KitLoaderManager / delegate / inject。
+3. 容器里每个 kit 本来就是独立安装的包，Activity 都在清单里声明过，
+   不需要动态注入 ClassLoader 也能起来。
+4. verifySession 返回 null 时改成轮询（60ms × 20），不再固定等 400ms。
+5. 日志新增：
+     act: stub verify ok pkg=… kit=… stub=…
+     act: stub 直连启动 <ComponentName>
+     act: stub 轮询 verify <耗时>ms -> true/false
+     act: stub verify 始终为 null，放行原流程 <类名>
+
+== 2.6.28 ==
+2.6.27 日志第一次把链路打穿到「一键登录/注册」：
+  11:36:58.193  HuaweiIDForSettingsActivity create（账号页）
+  11:37:00.817  HwIDStartUpGuideLoginActivity create（引导页，活到 resume）
+  11:37:02.329  resume 时 cmp 变成 account/LoginLoadingActivity（替换成功）
+  11:37:03.657  第一个跳板 HMSKitStandardC2NEStubActivity1 resume（没退）
+  11:37:04.582  它已变成 OneKeyLoginOrRegisterActivity，再起一个跳板
+  11:37:05.961  第二个跳板 post-create finishing=true -> 整栈退
+根因（日志硬证据，两次跳板对照）：
+  第1次(成功) action=262b8f36…  stub_session_id=null
+  第2次(失败) action=af682a02…  stub_session_id=262b8f36…  <- 旧值
+真实页面用 new Intent(getIntent()) 起下一个跳板，把**上一跳**的
+stub_session_id extra 一起复制走了，只换了 action。而 ContainerActivity 的
+setSessionIdAsAction() 会拿 extra 覆盖 action，于是新 session 被旧 session 顶掉，
+去 kams 查回来的是上一个 kit（已被前一个实例占住），注入失败 -> finish。
+改动：
+1. 新增 StubSession：在 execStartActivity 出手前、Activity onCreate 落地前，
+   只要 action 是 <hex>:com.huawei.hwid.containerN 形态，就把 extra
+   stub_session_id 强制对齐成 action。日志：stub session 对齐 xxx -> yyy
+2. 修正 2.6.27 的反射错误：loadKitInfoSuccess 的签名是 (Intent)Z 返回 boolean，
+   session 结果在 ContainerActivity.mStubLoadInfo 字段里，不是返回值。
+   2.6.27 按 (Intent)Bundle 反射永远取不到，9 次「verify 始终为 null」全是这个，
+   还白等了 1.2 秒。现在正确读 boolean + 字段。
+3. 轮询从 20×60ms 缩到 4×60ms，拿不到立刻放行，减少黑屏。
+日志新增：
+  act: stub verify ok uid=… pkg=… kit=… stub=…
+  act: stub verify=false（mStubLoadInfo=…），放行原流程 …
+  act: stub session 对齐 <旧> -> <新>
+
+== 2.6.29 ==
+2.6.28 的教训：反射修对之后直连「生效」了，但生效得太早——
+HwIDStartUpGuideLoginActivity（stubexplicit 页）本来是 HMS 自己能跑通的，
+被我们 onCreate 之前抢跑、直连 StartUpGuideLoginActivity 并 finish，
+结果账号页 startActivityForResult 收到 CANCELED，跟着一起退。
+日志表现：用户连点十几次图标，账号页 post-create 就 finishing=true。
+改动：
+1. 撤掉 StubLauncher.tryHandle 的调用，回到让 HMS 自己走 loadKitForActivity。
+   只保留 StubSession 的 session 对齐（2.6.28 里它 0 次触发，因为链路在第 2 步
+   就被直连掐断了，根本没走到 HMSKitStandardC2NEStubActivity1）。
+2. post-create 日志补跳板页状态：
+   stub{act=… sid=… uid=… kit=…}
+   下次失败能直接看出是 session 没查到还是 kit 加载失败。
+3. StubLauncher 保留 tryHandle/describe，但不再从 onCreate 调用。
+
+== 2.6.30 ==
+2.6.29 是决定性的一版：session 对齐生效，两个跳板的 session/kit 全对：
+  11:49:13  stub session 对齐 null -> d8c1196c…
+            post-create 跳板1 finishing=false
+            stub{act=null sid=d8c1196c… kit=…LoginLoadingActivity}
+  11:49:14  stub session 对齐 d8c1196c… -> 52c75183…
+            post-create 跳板2 finishing=true
+            stub{act=null sid=52c75183… kit=…OneKeyLoginOrRegisterActivity}
+  目标页 act: create com.huawei.hms.account 出现 0 次
+结论：loadKitInfoSuccess 已通过、mStubLoadInfo 拿到了、kit_component_name 也对，
+卡在后面 KitLoaderManager.loadKit() 或 mSecureIntent.a()（跨进程，外面修不了）。
+改动：新增 StubLauncher.rescue，在 super.onCreate **之后**调用——
+  1. 只在 isFinishing()==true 时动手（HMS 自己放弃了）
+  2. 只在「这个页面一次 startActivity 都没发过」时动手（避免把正常交接
+     的目标页起两遍；2.6.28 就是栽在没判断这个）
+  3. 直接 new Intent(getIntent()) + setComponent(kit) + 清 action/session extra
+     + FLAG_ACTIVITY_FORWARD_RESULT 启动，然后由跳板页自己 finish
+日志：
+  act: stub 兜底启动 <ComponentName>
+  act: stub 跳过兜底：已交接给下一跳 …
+  act: stub 兜底放弃：mStubLoadInfo 为空 / 没有 kit_component_name
+补充（同 2.6.30）：
+2.6.29 里跳板 1 其实已经成功换成 OneKeyLoginOrRegisterActivity 并 resume 了
+（16.426 resume 时 cmp 已是真实类），但它在 16.451 又 startActivityForResult 拉
+跳板 2，而跳板 2 的 kit_component_name 还是 OneKeyLoginOrRegisterActivity —— 
+同一类自己拉自己。容器里第二层必失败，失败回 CANCELED，把刚显示的页面带走。
+所以 rescue 加两条保护：
+  1. 目标类本进程已 resume 过 -> 不启动，直接 setResult(RESULT_OK)，让调用方继续
+     （否则会无限套娃）
+  2. 全进程 rescue 上限 6 次，防异常递归
+日志：act: stub 兜底：目标页已在本进程，回 RESULT_OK <类名>
+
+== 2.6.31 ==
+2.6.30 第一次真正把 kit 页面拉起来，也第一次拿到崩溃栈，两个问题都定位了：
+
+问题一：跳板2 其实自己已经发起了启动
+  18.890  act: post-create 跳板2 finishing=true
+  18.890  act: start from=跳板2 req=-1 cmp=…OneKeyLoginOrRegisterActivity
+  18.935  act: stub 兜底启动 …OneKeyLoginOrRegisterActivity   <- 我们又起了一遍
+  HMS 的 startActivity 是 post 到主线程队列的，onCreate 返回时还没跑；
+  rescue 同步执行就抢在它前面，把同一页起了两份。
+  改：rescue 改成 postDelayed 150ms，让 HMS 先出手；它出手过 STARTED 就有
+  记录，兜底自动跳过。
+
+问题二：kit 进程的 Application 是原生 Application
+  p7  bind: makeApplication ok -> android.app.Application
+  p2  bind: makeApplication ok -> com.huawei.hms.app.CoreApplication
+  2.6.18 为了让 kit 进程别抛 ClassNotFoundException，把 kit 包的
+  ApplicationInfo.className 一律改成 android.app.Application。这对只跑
+  Service 的进程没问题，但 account kit 的页面在**构造函数**里就要 Context：
+    Base20Activity.<init> -> new TransInfo() -> new PackageManagerHelper()
+    -> context.getPackageManager()  ->  NPE（context 为 null）
+  这个 static context 是 CoreApplication.attachBaseContext 里设置的。
+  改：account kit 的 ApplicationInfo.className 用 CoreApplication，和
+  p2/p4/p5/p6 一致；其余 kit 仍退化成 android.app.Application。
+日志新增：无（沿用 stub 兜底那几行），但下一版应看到
+  "act: stub 跳过兜底：已交接给下一跳" 而不是 "stub 兜底启动"。
+
+== 2.6.32 ==
+2.6.31 暴露了根本错误，也让我看清了 kit 页面的真身。
+反编译 account 的 dex：
+  OneKeyLoginOrRegisterActivity
+    -> SmsBaseActivity -> x9 -> ak0
+    -> com.huawei.hms.runtimekit.container.kitsdk.KitActivity
+    -> com.huawei.hms.runtimekit.container.kitsdk.KitContext
+KitActivity 的父类是 KitContext，**不是 android.app.Activity**。
+也就是说 kit 页面是「虚拟 Activity」，只能由 ContainerActivity 的 delegate
+代理，任何 startActivity 都起不来：
+  2.6.30 报 Unable to instantiate（构造函数 NPE）
+  2.6.31 报 ClassCastException: cannot be cast to android.app.Activity
+这两个版本走的路从根上就是错的，撤回。
+回退：
+1. kit 包的 Application 恢复成 android.app.Application（2.6.31 改成
+   CoreApplication 后，kit 进程里 Tracker 报 NoSuchMethodError: W.b.e、
+   multidex 重排把类层次搞乱，更糟）。
+2. rescue 不再 startActivity 任何东西。
+改成诊断 + 修复：
+3. 跳板页 onCreate 之后如果 finishing，重放 ContainerActivity 的后两步：
+   - KitLoaderManager.loadKit(mStubLoadInfo, false) -> 记返回值/异常
+   - inject(kit_uid, stubActivityDelegate) -> 记返回值/异常
+4. 把 mStubLoadInfo 的所有 key/value 打进日志（之前只看 kit_uid 和
+   kit_component_name，看不到 apk_path 这种关键字段）。
+5. loadKit 失败时，按容器里的实际位置修正 session 里的 apk_path /
+   native_path（真机是 split 路径，容器里 account 是独立安装的包），再试一次。
+日志：
+  act: stub info keys=...                     <- session 全量
+  act: stub loadKit -> true/false
+  act: stub loadKit 抛异常 ...
+  act: stub 修 apk_path ... -> ...
+  act: stub inject -> true/false
+补充（同 2.6.32）：
+新增 StubLauncher.prewarm，在跳板页 super.onCreate 之前执行：
+  verifySession -> 修正 bundle(apk_path / native_path / kit_app_class)
+  -> KitLoaderManager.loadKit(...)
+HMS 随后自己再调 loadKit 时，KitLoaderManager 里已有这个 kit 的缓存，
+第二次直接成功，inject 才有机会跑通。
+这是唯一能在「onCreate 内部失败并 finish 之前」插入的时机。
+
+== 2.6.33 ==
+2.6.31 日志（用户实测）已经能显示 OneKeyLoginOrRegisterActivity，页面报
+「没有网络，无法下一步」。根因不在网络，在容器的权限层：
+
+HMS Framework 的 NetworkUtil.isNetworkAvailable() 反编译原文：
+    checkSelfPermission(ctx, "android.permission.ACCESS_NETWORK_STATE")
+    != 0  ->  return false        // 连 getActiveNetworkInfo() 都不调用
+容器里这条权限查询必然是 DENIED：
+    BPackageManagerService.mPermissions 全仓库没有任何 put，
+    getPermissionInfo() 永远返回 null，
+    于是退到 HushCore.getPackageManager().checkPermission(perm, 虚拟包名)
+    -> 宿主里没有这个包 -> DENIED。
+所以 HMS 认为「无网络」，页面直接卡住。
+
+改动：
+1. IActivityManagerProxy.checkPermission 白名单加网络类 normal 权限
+   （ACCESS_NETWORK_STATE / INTERNET / ACCESS_WIFI_STATE /
+     CHANGE_NETWORK_STATE / CHANGE_WIFI_STATE / ACCESS_NETWORK_CONDITIONS）
+2. IPermissionManagerProxy.checkPermission 同样加（Android 11+ 走这条）
+3. BPackageManagerService.checkPermission / checkUidPermission 同样放行
+4. 撤回 2.6.32 的 prewarm 调用：2.6.31 已证明第一跳不需要预热，
+   预热只会在 HMS 自己的 loadKit 之前动缓存，属于额外变量
+5. 新增网络取证日志（每个 HMS 页面一次）：
+   net: checkSelf=0 active=WIFI/true on=…OneKeyLoginOrRegisterActivity
+   checkSelf 非 0 = 权限层没放行；active=null = 真的没网
+
+== 2.6.34 ==
+这次日志（11.5MB，89039 行）里有两条硬证据，都不是猜测。
+
+【证据一】启动两秒退回框架 = 埋点线程把进程打死
+FATAL 统计：NoSuchMethodError 70 次，占全部崩溃 64%。
+    java.lang.NoSuchMethodError: No static method
+      e(ILjava/lang/String;Ljava/util/LinkedHashMap;)V in class LW/b;
+        at com.huawei.hms.commonkit.measurement.Measurement.onEvent
+        at com.huawei.hwid.common.util.Tracker.reportImpl
+        at com.huawei.hwid.common.util.HiAnalyticsUtil$3.run
+线程名 Hwid-Tracker-PoolN，是子线程。
+W/b 在 hwid/base.apk 里，Measurement 在 commonkit 里，两个 kit 的混淆类
+撞了名字、版本对不上。这是纯埋点上报，跟登录流程一点关系都没有，
+但它走到默认 handler，ART 直接杀进程 —— 用户看到的就是「进去两秒退回框架」。
+
+改动：CrashHandler 增加 swallow()，四个条件同时满足才吞：
+    非 main 线程 / 进程是 hwid 或 hms.* / 异常是 LinkageError /
+    栈里有 Tracker|Measurement|HiAnalytics|commonkit
+吞掉只记一行 crash: swallow 埋点异常，进程继续活着。
+
+
+【证据二】账号页 Activity 根本构造不出来
+    java.lang.RuntimeException: Unable to instantiate activity
+      ComponentInfo{com.huawei.hms.account/...StartUpGuideLoginActivity}
+    Caused by: NullPointerException:
+      Attempt to invoke 'PackageManager getPackageManager()' on a null object
+        at com.huawei.hms.account.base.util.PackageManagerHelper.<init>
+        at com.huawei.hwid.common.datatype.TransInfo.<init>
+
+反编译 AccountKit-base.apk 还原出完整链条：
+    PackageManagerHelper(Context ctx){ this.a = ctx.getPackageManager(); }
+    TransInfo(...){ new PackageManagerHelper(gm.b().a()); }
+    class gm { private Context a;
+               private gm(){ a = CoreApplication.getCoreBaseContext(); } }
+    CoreApplication: public static Context e;
+                     public static Context getCoreBaseContext(){ return e; }
+                     static void k(Context c){ e = c; }
+也就是说 e 从来没人赋值（attachBaseContext 只写 f，不写 e），
+gm 拿到 null，一路 NPE 到 Activity 构造。
+
+根因：kit 包被当成独立包装，Application 降级成 android.app.Application
+（2.6.18 起的既定策略，2.6.31 试过换 CoreApplication，引发 Tracker 崩溃 +
+multidex 类层次错乱，已回退），CoreApplication.attachBaseContext 从没跑过。
+
+改动：新增 HmsKitCtx，在 makeApplication 之后、任何 Activity 之前，
+反射调用 CoreApplication.k(app) 把 e 补上，f 为空也补；
+account 进程再修一次已经创建好的 gm 单例（实例字段 a 直接写）。
+日志：kitctx com.huawei.hms.account CoreApplication.e=android.app.ReceiverRestrictedContext set=true
+
+其余保留：2.6.33 的网络权限白名单、stub 兜底、session 对齐、全部取证日志。
+
+【怎么确认装的是哪一版】
+点 HMS Core 图标 → 屏幕下方立刻弹一行字：
+    HushSpace 2.6.34(154)
+这行是 App 自己打的，跟日志无关。看到 151 就是旧包没装上。
+
+【自查记录】
+2.6.34 第一版把「进程名含 huawei.hwid」当成吞异常的条件之一，
+但 Diag.processName() 返回的是宿主名 com.hush.space:p10，
+这个条件永远不成立，等于没吞。已改成只看栈内容（同时含 huawei 和
+Tracker/Measurement/HiAnalytics/commonkit），不信进程名。
+
+== 2.6.35 ==
+2.6.34 装上了（Toast 显示 154），点 HMS 仍然退回框架，而且拿回来的
+diag.log 还是 12:31 那份 —— 日志通道本身断了。
+
+【日志为什么固定住】
+主日志在 Android/data/com.hush.space/files/diag.log。
+华为/荣耀的 ROM 卸载时不清理 Android/data，重装后这份 11MB 旧文件还在，
+但属主已经不是新装的 uid，FileOutputStream(f, true) 直接 EACCES。
+Diag 里这一路是 try-catch 吞掉的，于是：
+    sOut = null
+    -> 落到 context.getFilesDir()/diag/diag.log（内部存储）
+    -> 用户翻遍 Android/data 也只能看到那份旧的。
+日志里 out=NULL 就是这个状态，只是它自己也写不进去，所以看不出来。
+
+改动：
+1. 打开前先 ensureWritable：不可写就 setWritable，还不行就删掉重建。
+   宁可丢掉历史，也不能没有新日志。
+2. 新增第二路镜像 /sdcard/Download/HushSpace/diag.log，
+   走公共目录，任何文件管理器都能直接打开，超过 8MB 自动清空。
+3. boot 行加 mirror=ok/NULL，一眼看出第二路通没通。
+
+【失败原因上屏】
+StubLauncher 的每个失败分支都加了 Toast：
+    "华为账号加载失败：loadKit 失败"
+    "华为账号加载失败：inject 返回 false"
+    "华为账号加载失败：session 为空"
+正常走通时不会弹。这样即使日志又断了，用户看一眼就知道卡在哪一步。
+
+【关于 154 仍然退回】
+2.6.31 日志里已经能确认：stub Activity 一 create，进程要么被 Tracker
+打死（已修），要么 loadKit 失败后 finish。154 吞掉了 Tracker，
+剩下的大概率是 loadKit/inject 那一步。2.6.35 就是要把这一步的返回值
+和异常抓出来 —— 日志镜像 + Toast 双保险。
+
+== 2.6.36 ==
+2.6.35 装上了，Toast 说「华为账号加载失败：找不到 KitLoaderManager」。
+这句话直接指出了我的一个硬 bug，不是 HMS 的问题。
+
+【为什么找不到 KitLoaderManager】
+KitLoaderManager 在 Framework-runtime.apk 里，由 runtimekit 自己的
+DexClassLoader 加载。我之前写的是：
+    Class.forName("com.huawei.hms.runtimekit.kitloader.KitLoaderManager")
+只有一个参数的 Class.forName 用「调用方所在的 ClassLoader」，也就是宿主
+com.hush.space 的 PathClassLoader。那个 CL 里只有宿主自己的 dex，
+永远看不到 Framework-runtime 里的类 —— 所以必然 ClassNotFoundException，
+我把它 catch 成 null，于是报「找不到」。
+
+反编译确认类是真的存在，签名也对：
+    Lcom/huawei/hms/runtimekit/kitloader/KitLoaderManager;
+    public static getInstance(Landroid/content/Context;)L...KitLoaderManager;
+    public loadKit(Landroid/os/Bundle;Z)Z
+    public inject(Ljava/lang/String;LE/d;)Z
+    static 字段 f 就是单例缓存
+ContainerActivity 自己也是调 getInstance(this)，没有别的入口。
+
+改动：Class.forName(name, false, cl) 依次尝试
+    ① 跳板页自己的 ClassLoader（a.getClass().getClassLoader()）
+       —— ContainerActivity 和 KitLoaderManager 同在 Framework-runtime.apk，
+          这个 CL 必然能加载，而且拿到的 f 就是 HMS 用过的那个实例，
+          loadKit 的缓存因此共享；
+    ② 线程上下文 CL；
+    ③ 宿主 CL（兜底）。
+并且 getInstance 传的是 Activity 本身，不是 Application，和 HMS 完全对齐。
+
+【顺带纠正一个误判】
+2.6.33 撤掉 prewarm 的理由是「日志证明预热无效」。现在看，那是因为
+prewarm 内部调的就是这个坏掉的 kitLoader，它从来没拿到过 KitLoaderManager，
+等于什么都没做。所以「预热无效」这个结论是错的。
+2.6.36 恢复 prewarm 调用，放在 super.callActivityOnCreate 之前：
+先改对 session 里的 apk_path / native_path / kit_app_class，再 loadKit 一次，
+HMS 自己的 loadKitForActivity 随后就会命中缓存直接成功。
+prewarm 全程 try-catch，不 finish、不 startActivity，不碰生命周期
+（2.6.28 的 SuperNotCalledException 是 return 掉 super.onCreate 造成的，
+这次没有这个问题）。
+
+【这一版会看到什么】
+点了 HMS 之后 Toast 会推进到下一句，可能是：
+    loadKit 失败        -> 说明 kit 的 dex/Application 建不起来
+    inject 返回 false   -> 说明 delegate 类型对不上
+    什么都不弹 + 页面留下 -> 通了
+不管哪一句，都比现在的「找不到 KitLoaderManager」更接近真相。
+
+日志：现在有两份，主文件 Android/data/com.hush.space/files/diag.log，
+镜像 /sdcard/Download/HushSpace/diag.log（超过 8MB 自动清空）。
+关键行：
+    stub 预热开始 ...
+    stub 预热 verify -> true/false
+    stub 预热 loadKit -> true/false
+    stub KitLoaderManager ok via activityCL
+
+== 2.6.37 ==
+这份 diag.log 第一行是：
+    boot: process=com.hush.space pid=21171 ver=2.6.20(140) ...
+版本是 2.6.20(140)，不是 2.6.36(156)。差 16 个版本。
+三个互相独立的证据：
+  1. ver=2.6.20(140)；
+  2. 这一行没有 mirror= 字段 —— mirror 是 2.6.35 才加的，
+     2.6.20 里根本不存在；
+  3. 日志里有
+     bind: handleBindApplication FAILED at start
+     Can't create handler inside thread Thread[binder:21946_3]
+       at com.huawei.hms.app.CoreApplication.a(CoreApplication.java:3)
+       at CoreApplication.attachBaseContext
+     com.huawei.hwid.persistent 在 binder 线程里 makeApplication，
+     CoreApplication.attachBaseContext 第一件事 new Handler()，没有 Looper。
+     这条 2.6.24 就用 callOnGuestMain 把 makeApplication 挪到主线程修掉了，
+     2.6.20 里还在。
+所以手机上跑的是 2.6.20 的代码，2.6.36 的两处改动（KitLoaderManager 的
+ClassLoader、prewarm 恢复）一次都没执行过。
+
+【这一版只做一件事：让装错版本这件事不可能被忽略】
+1. 桌面图标名从「hush 空间」改成「hush 2.6.37」。
+   装完回到桌面，名字没变 = 没装上，别的都不用看。
+2. versionCode 157 / versionName 2.6.37，boot 行会打 ver=2.6.37(157)。
+3. 点 HMS 的 Toast 仍然是 HushSpace 2.6.20 / 2.6.37 这种字样。
+
+【装之前】
+手机上可能躺着一堆同名 APK。认文件名：HushSpace-2.6.37-v157-装这个.apk。
+如果安装时提示「应用未安装」，是签名冲突：先在设置里卸载 hush 空间，
+再从这份文件安装。卸载会清空空间里的应用和数据。
+
+== 2.6.38 ==
+2.6.37 第一次真正跑通了整条跳板链，日志（13:43:51–13:44:02）：
+    stub 预热 verify -> true
+    stub KitLoaderManager ok via activityCL
+    stub loadKit -> true
+    stub inject -> true
+    act: post-create ... finishing=false
+    act: resume HMSKitStandardC2NEStubActivity1
+以前是「点开两秒退回框架」，这次页面留住了。剩下的是页面显示「无网络」。
+
+【不是真的没网】
+    net: checkSelf=0 active=MOBILE/true
+宿主进程里查，权限 GRANTED，移动数据已连接。所以是「查不到」，不是「没有」。
+
+【HMS 怎么判断网络】
+反编译 hmscore 6.16.4.362，入口是 z0.m.a(Context)：
+    ctx.checkPermission("android.permission.ACCESS_NETWORK_STATE",
+                        Binder.getCallingPid(), Binder.getCallingUid())
+    → ctx.getSystemService("connectivity")
+    → cm.getActiveNetwork() + getNetworkCapabilities(net)
+      hasTransport(CELLULAR=0 / WIFI=1 / ETHERNET=3 / …)
+      或 hasCapability(NET_CAPABILITY_VALIDATED=16)
+    → 兜底 cm.getActiveNetworkInfo().isConnected()
+任何一步拿不到就 return false，页面就写「无网络」。
+注意它用的是 guest 自己的 Context，不是我们那个 stub Activity。
+两者在容器里绑的包名/uid 不一样，结果可能完全不同 —— 这也是为什么
+2.6.33 放行 checkPermission 之后日志显示 checkSelf=0，页面还是说没网。
+
+【改动】
+1. HmsKitCtx 增加 fixConnectivity：guest Application 建好之后，先用
+   app.getSystemService("connectivity") 触发缓存，再把
+   ContextImpl.mServiceCache 里那个 ConnectivityManager 换成宿主的实例
+   （宿主 uid + 宿主包名 + 权限齐全），并把 guestCm 的 mContext 也换成宿主。
+   日志：netfix com.huawei.hwid guestCm=ok 替换=1 cacheLen=…
+2. traceNet 增加 guest 侧取证：
+   net: guest ctx=… cm=ok info=MOBILE/true cap[wifi=false,cell=true,eth=false,valid=true]
+   net: HMS DeviceUtil.checkNetwork -> true/false
+   最后一行是直接反射调 HMS 自己的判断函数 —— 它说 false，页面就一定写「无网络」。
+
+【下一份日志看三行】
+    netfix … 替换=N
+    net: guest … info=…
+    net: HMS DeviceUtil.checkNetwork -> ?
+
+== 2.6.39 ==
+2.6.38 的日志第一次把「无网络」这句话钉死在两个事实上：
+
+【事实一：手机有网，而且系统自己验证过】
+    net: checkSelf=0 active=MOBILE/true
+    net: guest ctx=…CoreApplication cm=ok info=MOBILE/true
+         cap[wifi=false,cell=true,eth=false,valid=true]
+valid=true 是 Android 自己做的联网校验（captive portal 检测）通过之后才有的
+标记。也就是说，系统层面这个移动数据确实能上外网。
+所以「没有网络」不是用户的网络问题，是容器/HMS 这一侧的判断问题。
+
+【事实二：卡住的页面是协议页，不是登录页】
+    kit_component_name=ComponentInfo{com.huawei.hms.account/
+        com.huawei.hwid.ui.common.login.PrivacyPolicyFeatureA…}
+这一页是 WebView。日志里能看到它每次起来都会拉一个 chromium 渲染进程：
+    svc: onServiceConnected …/org.chromium.content.app.SandboxedProcessService0
+然后 2~4 秒被销毁，再重建，一共三轮（14.4 / 18.0 / 25.8），
+最后 30.8 秒整栈退出 —— 就是「看到页面→写无网络→退回框架」。
+
+【上一版的两个错误】
+1. 猜 z0.m / DeviceUtil 去问 HMS 的结论，运行时 ClassNotFoundException，
+   等于什么都没问。已换成反编译确认的真身：
+       com.huawei.hwid.common.util.NetUtils
+         getNetworkState(Context)        0 = 无网
+         getActiveNetWorkInfo(Context)   null = 无网
+         getNetType(Context)             "NONE" = 无网
+   并且用 Application 的 ClassLoader（10 个 dex 的共享 CL）加载，
+   stub 自己的 CL 看不到 kit，这也是上次失败的原因之一。
+2. 只证明了「系统说连着」，没证明「这个进程真能把包发出去」。
+   ConnectivityManager 说连着、socket 被拒的情况很常见（联网控制、
+   uid 级防火墙、DNS 不通、TLS 失败），现象都是页面写「无网络」。
+
+【这一版只做取证，四路互相印证】
+1. 权限：netprobe … perm INTERNET=GRANTED/DENIED ACCESS_NETWORK_STATE=…
+2. 真实联网：netprobe host=… dns=…(ms) tcp=…(ms) https=…(ms)
+   三个目标：grs.dbankcloud.com（HMS 寻址）、hwid1.vmall.com（登录/协议页）、
+   www.baidu.com（对照）。宿主进程一份、容器进程一份，谁的锅一目了然。
+3. WebView 自己：netweb … dataDir=… exists=… canWrite=… provider=…
+                 netweb … load https://hwid1.vmall.com/
+                 netweb … finished / ERROR code=… / httpError 4xx
+   WebView 的 profile/cache 都写在 dataDir 下，容器里这个路径是 guest 包名，
+   native 层不做重定向 —— 写不进去时 Chromium 会直接判「网络不可用」，
+   这一组日志就是验证它。
+4. HMS 自己的结论：netprobe … NetUtils.getNetworkState=… 
+5. 附加：容器进程打开 logcat 快照（lg: 开头），chromium 的 net::ERR_* 
+   和 HMS 自己的报错都在里面。
+
+【下一份日志看五行】
+    netprobe host:…        → 手机有没有网（对照 www.baidu.com）
+    netprobe guest:…       → 容器能不能发出去
+    netweb  … ERROR code=  → WebView 那一层断在哪
+    NetUtils.getNetworkState= → HMS 认为有没有网
+    lg: …                  → HMS/chromium 自己说的话
+
+这五行一出，就不用再猜了：是权限、DNS、TLS、WebView 存储，还是 HMS 判断，
+直接落到某一层。
+
+== 2.6.40 ==
+2.6.39 只做取证，没有改行为。这一版把「协议页显示无网络」真正按容器和真机的
+差异修掉，根因不是手机没网，而是 HMS 的 split 语义在容器里只恢复了一半。
+
+【为什么框架不适配 HMS Core】
+HMS Core 6.x 不是一个普通 APK，而是一个「base + 一堆 kit」的动态模块体系：
+  - 真机上 kit 是 split，全部跑在 com.huawei.hwid 的进程里；
+  - 所有 split 共用同一个 ClassLoader、同一个 Application；
+  - 所有 split 共用同一个 AssetManager / Resources（资源表安装时合并过一次）；
+  - 所有 split 共用同一个 dataDir，WebView 的 profile/cache 也在里面。
+容器把每个 kit 当成独立安装的普通应用，2.6.24/2.6.25 只补了「dex 串成一条 +
+ClassLoader 共用」，另外三样一直没补：
+  1. assets / resources 仍是各看各的：hwid 进程里打开 account kit 的协议页，
+     H5 的 file:///android_asset/... 在 hwid 的 AssetManager 里不存在；
+  2. WebView 数据目录：VCore 只给 device-protected 目录建 app_webview，
+     真正的 credential dataDir 下没有；
+  3. 明文流量策略：宿主 targetSdk=28，WebView 默认禁止 http；HMS 的 H5 里
+     混着明文资源，被拦后页面只会显示自己的「无网络」兜底页。
+所以前面所有版本都在跟「kit 页面能不能起来」赛跑，起来之后必然卡在协议页。
+
+【2.6.40 改动】
+1. HmsKitCtx.shareAssets：HMS 进程绑定时，把其它 HMS 包（hwid + account +
+   game + 七个 Framework kit）的 base.apk 追加进当前进程的 AssetManager。
+   顺序在 hwid 本体之后，已有资源 ID 仍由本体优先解析，不会改现有页面。
+   日志：kitctx 共享 assets com.huawei.hwid += com.huawei.hms.account cookie=…
+2. HmsKitCtx.prepareWebViewDir：在 guest 的 credential dataDir 下补建
+   app_webview，并打印 exists/write。
+   日志：kitctx com.huawei.hwid webview dir=… ok=true write=true
+3. PackageManagerCompat.generateApplicationInfo 给 HMS 系包强制打开
+   ApplicationInfo.FLAG_USES_CLEARTEXT_TRAFFIC，恢复真机上 HMS 清单的
+   usesCleartextTraffic=true 语义（只对 com.huawei.hwid / com.huawei.hms.* 生效）。
+4. HmsKitCtx.preInstall：在 makeApplication 之前先用 packageContext 填好
+   CoreApplication.e/f。CoreApplication.attachBaseContext 里初始化的
+   NetworkUtil / Manager 单例不会再缓存 null；Application 建好后再换成
+   Application 本身。
+5. IConnectivityManagerProxy 在 binder 出口统一改写包名：kit 页面用的是
+   HMS 自己 new 的 KitContext，它的 ConnectivityManager 绑的是虚拟包名
+   （com.huawei.hms.account 等），system_server 的 AppOps.checkPackage
+   对不上宿主 uid，查询直接失败。现在凡是把华为/荣耀虚拟包名传给
+   IConnectivityManager 的，一律换成宿主包名，和内核 uid 对齐。
+6. 撤掉 2.6.39 在 HMS 进程里 new WebView 的探针：它会提前初始化 Chromium，
+   和 HMS 自己的 WebView 抢数据目录和渲染进程，反而把要观察的页面弄坏。
+   HTTP/DNS/TCP 探针保留。
+7. VCore 同时给 credential / device-protected 两个 dataDir 建 app_webview。
+
+【怎么验证】
+点 HMS Core → 华为账号 → 隐私协议页，应该能看到 H5 正文，不再显示「无网络」。
+日志里看四行：
+  kitctx 共享 assets … cookie=非0
+  kitctx … webview dir=… ok=true write=true
+  netprobe guest:… https=200
+  netweb … finished（这一行 2.6.40 起不再由容器主动打，只有 HMS 自己日志可见）
+如果仍然显示无网络，把 diag.log 里 netprobe 的五行发回来，就能直接定位到
+DNS / TCP / HTTPS / WebView 哪一层。
+
+
+== 2.6.41 ==
+【现象】点 HMS Core / 华为账号，登录页起来几十毫秒自己 finish，界面直接退回框架。
+2.6.40 日志（18:11:41~18:11:45，四次尝试全部复现）：
+  act: create …OneKeyLoginOrRegisterActivity  stub{… }
+  act: post-create … finishing=true
+  act: destroy …
+整条链是 HuaweiIDForSettingsActivity → HwIDStartUpGuideLoginActivity →
+LoginLoadingActivity → OneKeyLoginOrRegisterActivity，最后一步 onCreate 里
+立刻 finish，所以表现为「点开又自己退回」。
+
+【根因】不是网络，也不是 WebView，而是 Parcelable 的类身份被拆成了两份。
+反编译 AccountKit-base.apk 的 OneKeyLoginOrRegisterActivity：
+  onCreate → C9()
+    mCarrierData = getIntent().getParcelableExtra("carrierDataKey")
+    if (mCarrierData == null) { finish(); }   // → 页面秒退
+carrierDataKey 里的对象是 LoginLoadingActivity 用 account kit 自己的
+CarrierData 类 new 出来的。真机上 kit 页面和 hwid 共用一份 ClassLoader，
+序列化再反序列化回来还是同一个 Class。
+
+容器里的链路：
+1. Intent 要经过我们的 ActivityStack 和真实 system_server 来回 Parcel；
+2. 回到 guest 进程时，ActivityThread 用 **guest 的 ClassLoader** 反序列化
+   （2.6.25 已把 kit 的 dex append 进去），于是 CarrierData 由 guest CL 定义；
+3. runtimekit 给 kit 建的却是另一份 DexClassLoader（ClassLoaderManager
+   newKitClassLoader 的父加载器是 ClassLoader.getSystemClassLoader()，
+   在容器里就是宿主/system CL，不是 guest CL），OneKey 页面里的
+   checkcast CarrierData 用的是 kit CL 那一份；
+4. 两个 Class 不是同一个，checkcast 抛 ClassCastException，被 runtimekit
+   的 V.d.getParcelableExtra 吞掉返回 null → C9 判定「无运营商数据」→ finish。
+
+同样的 double-definition 问题也出现在 session 里的 kit_secure_intent
+（kams 预存的 intent），所以只修 ClassLoader 还不够，那份 intent 也要丢。
+
+【2.6.41 改动】StubLauncher（只改这一个文件）
+1. prewarm 在 loadKit 成功、kit ClassLoader 建好之后调用 repairExtras()：
+   把 intent 的 extras 先 writeBundle 到 Parcel，再用 kit 自己的
+   getKitClassLoader(kit_uid) 读回来，再 replaceExtras。
+   这样 CarrierData 等 Parcelable 变成 kit CL 里的那一份，checkcast 通过。
+2. stripSecureIntent：mStubLoadInfo 里如果有 kit_secure_intent 直接删掉，
+   让 ContainerActivity 用跳板页自己这份（已经修过的）intent。
+3. describe() 的 stub{…} 增加 carrier= 字段，日志里可以直接看到 kit 页面
+   实际拿到的 intent 里运营商数据在不在。
+4. 版本号 2.6.40(160) → 2.6.41(161)。
+
+【怎么验证】
+点华为账号，日志里应出现：
+  act: stub 重解 extras kit=… keys=[…, carrierDataKey, …] carrier=com.huawei.hwid20.usecase.loginseccode.CarrierData carrierCl=… kitCl=…
+  act: post-create … stub{… carrier=com.huawei.hwid20.usecase.loginseccode.CarrierData}
+之后页面不再 finishing=true，应该停在运营商一键登录页（显示手机号/验证码），
+点击「其他方式登录」还能继续走短信登录。
+如果 carrier 仍然为 null，把这一行和 kitCl/carrierCl 两个值发回来即可。
+
+
+== 2.6.42 ==
+【现象】2.6.41 之后一键登录页已经能停住（199******83 + 立即登录/注册 +
+天翼帐号服务与隐私协议），点「立即登录/注册」弹
+「无法获取数据，请稍后再试。」（string/ao，hwid_one_key_request_error）。
+
+【先排除的】
+不是 2.6.41 的 CarrierData 问题：日志里 OneKey 页 post-create 的
+carrier=com.huawei.hwid20.usecase.loginseccode.CarrierData，且没有 finishing。
+也不是「页面自己退」：2.6.14 起页面能停留，只是请求失败。
+
+【证据】2.6.41 的 netprobe 三路 HTTPS:
+  hwid1.vmall.com      https=302  OK
+  www.baidu.com        https=200  OK
+  grs.dbankcloud.com   https=ERR  CertPathValidatorException:
+                                  Trust anchor for certification path not found.
+用 curl 复现：grs.dbankcloud.com 下发的链是
+  leaf -> Huawei CBG Application Integration CA -> (Huawei CBG Root CA 不下发)
+根证书是华为自签，只预装在华为/荣耀机型的系统 CA store 里，本机没有。
+account kit 的 assets/CBG_CA.cer 已验证就是这张根：
+  C=CN, O=Huawei, OU=Huawei CBG, CN=Huawei CBG Root CA（自签）
+GRS 是 HMS 的站点解析入口，它握手失败 -> 账号 API 站点解析不出来 ->
+一键登录校验请求走不出去 -> w7 -> 「无法获取数据」。
+
+【三种可能来路，探针一次区分】
+ ① t30.l(): getDeviceMccmnc 为 null -> t2()        （TerminalInfo 探针）
+ ② 运营商 SDK 取号失败 -> H4() -> t2()              （H4 探针）
+ ③ 运营商数据校验请求失败 -> w7(Bundle) -> t2()     （w7 探针 + 错误码）
+HMS 自己的日志走 wl0 -> logcat，容器进程没有 READ_LOGS 抓不到，
+所以 2.6.42 直接在 Java 方法上挂点（HmsProbe）。
+
+【2.6.42 改动】
+1. 新增 HmsTls（HushCore/core）：HMS 进程里把 assets/CBG_CA.cer（
+   X.509 华为自签根，BKS 兜底）读出来，和系统 TrustManager 组合
+   （先系统、失败再试华为根），设成进程默认 SSLContext +
+   HttpsURLConnection 默认 SSLSocketFactory。只增加信任锚，不关闭校验。
+2. HmsKitCtx：fixGm 不再只对 com.huawei.hms.account 生效 —— hwid 进程
+   的 NetworkClient -> gm.b().a() 同样会拿到 null context，SecureX509TrustManager
+   建不起来就退回系统链，grs 一样失败。
+3. 新增 HmsProbe（HushCore/utils）：在 account kit 的 ClassLoader 上挂
+   TerminalInfo.getDeviceMccmnc / OneKey.H4 / OneKey.w7 / OneKey.t2 四个点，
+   日志 tag 是 hms。
+4. StubLauncher.prewarm 每次预热打一行 telephony:
+   permReadPhone/simState/simOperator/subscriberId/networkOperator/networkType。
+5. 版本号 2.6.41(161) -> 2.6.42(162)；app_name 同步改为 hush 2.6.42
+   （之前一直停在 hush 2.6.39）；设置页版本来自 BuildConfig，自动跟着变。
+
+【怎么验证】点立即登录/注册，日志里看：
+  tls: 已读取信任锚 assets/CBG_CA.cer / 进程默认信任链已追加 Huawei CBG Root CA
+  hms: telephony: permReadPhone=… simState=5 simOperator=46011 …
+  hms: TerminalInfo.getDeviceMccmnc -> 46011
+  成功：不弹错误框，进入登录/注册接口
+  仍失败：日志会明确是多号段：
+    hms: 一键登录：运营商 SDK 取号失败（H4）         -> 运营商 SDK 这一层
+    hms: 一键登录：运营商数据校验失败（w7） bundle{…} -> 看服务端 errorCode
+    hms: 弹「无法获取数据」+ 栈
+       -> 栈顶若是 t30.l()，就是 mccmnc 为 null
+把这几行发回来即可。
+
+
+== 2.6.43 ==
+【2.6.42 日志结论：方向对了一半，探针挂错地方】
+2.6.42 日志（19:20）实测：
+  tls: 已读取信任锚 assets/CBG_CA.cer / 进程默认信任链已追加 Huawei CBG Root CA
+  hms: TerminalInfo.getDeviceMccmnc -> 46011
+  hms: 探针已挂 H4 / w7 / t2
+  ……之后 H4 / w7 / t2 一次都没触发
+也就是说：证书和 mccmnc 都不是这次的原因，弹框也不走 OneKey 的那三条回调。
+
+【真正文案对应】
+用 aapt2 查两条相近字符串：
+  string/ao (CS_ERR_for_unable_get_data) = 无法获取数据，请稍后再试。   <- 截图这句
+  string/tn (hwid_one_key_request_error) = 请求失败，请使用其他方式登录/注册。
+2.6.42 挂的 t2 用的是 string/tn，不是截图那句，所以永远不命中。
+截图那句来自 x9（SmsBaseActivity 的父类，账号 kit 所有页面的基类）：
+  x9.showRequestFailedDialog(bundle)
+    -> x9.dealRequestSucOrFail(bundle, ErrorStatus)
+         code 不在 70008800/70002004/70005007 特判表里
+         -> showErrorDialog(R.string.CS_ERR_for_unable_get_data)
+—— 这是通用请求失败出口，和「一键取号」无关。
+
+【2.6.43 探针（只加诊断，不改行为；除版本号外没改功能）】
+1. HmsProbe 改挂四处：
+   ① x9.showErrorDialog(int,int) 和 (String,int)  最终弹框 + 文案 + 调用栈
+   ② x9.showRequestFailedDialog(Bundle)           失败入口
+   ③ x9.dealRequestSucOrFail(Bundle, ErrorStatus) 错误码/原因
+   ④ HwIDRestClientCall.execute()                 URL、HTTP 码、code、
+      errCode、subErrCode、exception、errorMsg
+2. ErrorStatus 的 c()/d() 会解析成 code/reason 写进日志。
+3. 探针同时装在 kit CL 和 guest CL（2.6.41 已经证明同一个类两边各有一份，
+   只装一边可能完全不命中）。
+4. 版本号 2.6.42(162) -> 2.6.43(163)；app_name -> hush 2.6.43。
+
+【怎么验证】点「立即登录/注册」，日志里会出现：
+  hms: 探针装到 CL xxxx / xxxx
+  hms: http url=… http=… code=… err=… subErr=… ex=… msg=…
+  hms: dealRequestSucOrFail code=… reason=… bundle{requestError=<ErrorStatus …>}
+  hms: showErrorDialog(0x7f0b003a) 文案=无法获取数据，请稍后再试。
+       at …（调用栈能直接看到是哪个 usecase）
+把这四类行发回来，就能定位是「请求没发出去 / 发出了被服务端拒 /
+本地异常」中的哪一种。esp. http 行里的 err 和 exception 是关键。
+
+
+== 2.6.44 ==
+【2.6.43 日志结论】
+1. TLS 和 mccmnc 都没问题：
+   tls: 进程默认信任链已追加 Huawei CBG Root CA
+   hms: TerminalInfo.getDeviceMccmnc -> 46011
+2. 网络本身也是通的，HMS 请求全部 200：
+   getClientConfiguration 200 / getResource 200 / opLog 200 /
+   getUserSiteIdForLogin 200 / setTransferKey 200
+3. 唯一一个非 200：19:30:51.579
+   https://hwid-drcn.platform.hicloud.com/IdmClientApi/IDM/getSMSCodeV3?…&srcAppName=com.hush.space
+   http=500 code=500 err=0 subErr=0 ex=null
+   ——这是**短信页**（LoginOrRegisterBySmsActivity）取验证码，时间是 51.5，
+   而 OneKey 页 42.7 就 resume、44.47 就已经跳到短信页了，不是同一步。
+4. 关键：42.85 ~ 44.47 这段（点「立即登录/注册」到弹框）**没有任何 HMS
+   HTTP 请求**。说明这次失败在本地就返回了，请求根本没发出去。
+5. 2.6.43 挂的 showErrorDialog / showRequestFailedDialog /
+   dealRequestSucOrFail 依然一次都没触发 —— 弹框不是走 x9 这几个方法建的。
+
+【另一个重要线索：电话权限】
+每次预热都打：
+  hms: telephony: permReadPhone=-1 simState=5 simOperator=46011
+       subscriberId=ERR:SecurityException networkOperator=46011 networkType=20
+双卡、电信 46011、SIM 就绪，但：
+- checkSelfPermission(READ_PHONE_STATE) = -1（拒绝）
+- getSubscriberId() 抛 SecurityException
+原因是 BPackageManagerService.checkPermission 对 guest 包最终回落到宿主 PM
+按**虚拟包名**查询，宿主里没有 com.huawei.hwid 这个包 → 一律 DENIED；
+2.6.33 只对 ACCESS_NETWORK_STATE 等几个 normal 网络权限做了放行。
+另外宿主 AndroidManifest 本身也没声明 READ_PHONE_STATE。
+天翼（ctc）一键登录 SDK 取号要用 READ_PHONE_STATE / IMSI，被拒就会本地失败，
+这正好解释「没有发出任何请求就弹无法获取数据」。
+
+【2.6.44 改动（诊断为主）】
+1. HmsProbe 改挂真正建弹框的地方：
+   a) x9.handleRequestFailed / handleRequestFailedMore / handleRequestFailedOther
+      （按方法名挂所有重载；x9:741-762 里 createCommonDialog 用的就是
+       R.string.CS_ERR_for_unable_get_data，即截图那句）
+   b) UIUtil.createCommonDialog / createAlertDialog / createCommonErrorDialog
+      全部重载，参数里的资源 id 会直接解析成文案，并打调用栈
+   c) AlertDialog.Builder.setMessage(CharSequence) 兜底：任何 ClassLoader、
+      任何类建的弹框，只要文案含「无法获取」或「请求失败」就记下来
+2. http 探针增加 body：非 200 时打印响应体前 240 字（getSMSCodeV3 那个 500
+   的 body 里会有服务端 errorCode/desc）。
+3. 增加 probe CL 日志：probe CL kit=xxx guest=xxx，确认两边都挂上了。
+4. 版本号 2.6.43(163) -> 2.6.44(164)；app_name -> hush 2.6.44。
+
+【怎么验证】点「立即登录/注册」等弹框出现，把日志发回来，重点看：
+  dlg: UIUtil.createCommonDialog(<ctx>, 无法获取数据，请稍后再试。, …)
+       at x9.handleRequestFailedOther(...)   <- 栈会指出确切调用方
+  dlg: 请求失败处理Other(…)
+  dlg: setMessage: 无法获取数据，请稍后再试。
+如果栈里出现运营商 SDK（ctc / tianyi / com.huawei.hwid20.carrier），
+下个版本就加宿主 READ_PHONE_STATE 权限并在容器里放行 telephony 权限。
+
+
+== 2.6.45 ==
+【2.6.44 抓到了确切链路】
+  hms: http url=…/IdmClientApi/IDM/getSMSCodeV3?…&srcAppName=com.hush.space
+       http=500 code=500 err=0 subErr=0 ex=null
+       body={"errorCode":70001201,"errorDesc":"Parameter[deviceID]is invalid"}
+  dlg: setMessage: 无法获取数据，请稍后再试。
+       at ll1.q(UIUtil.java:22)
+       at ll1.o(UIUtil.java:5)
+       at SmsBaseActivity.j2(SmsBaseActivity.java:50)
+       at rm0.F(LoginBySMSEngine.java:212)
+       at rm0.l(LoginBySMSEngine.java:1)
+       at rm0$d.onError(LoginBySMSEngine.java:59)
+
+结论：不是证书、不是网络、不是运营商取号，是**服务端认定 deviceID 非法**。
+弹框是登录引擎 onError -> SmsBaseActivity.j2 -> UIUtil 建的，所以之前挂
+showErrorDialog / handleRequestFailed* 都没命中（那些是别的错误出口）。
+
+【deviceID 是怎么来的】DeviceInfoUtil.getRegisterDeviceInfo：
+  华为机且支持 UDID -> 有 SN 用 SN（deviceType 8），没 SN 用 UUID（6）
+  非华为机        -> unitedId（TerminalInfo.getDeviceId，通常是 IMEI）
+  取不到 IMEI    -> 退 TerminalInfo.getUUid
+     getUUid 走 content://com.huawei.hwid.inner.provider 查 UUID，
+     容器里这条 provider 链路取不到值就变成 ""，
+     deviceID="" 发给服务端 -> 70001201 Parameter[deviceID] is invalid。
+而 IMEI / SN 都要 READ_PHONE_STATE：
+  日志每次都是 permReadPhone=-1、subscriberId=ERR:SecurityException。
+
+【2.6.45 改动】
+1. app/src/main/AndroidManifest.xml 增加：
+   READ_PHONE_STATE、READ_PHONE_NUMBERS
+2. HushMainActivity.onCreate 主动请求这两条运行时权限（一次性系统弹窗）。
+3. BPackageManagerService.checkPermission 增加「guest 清单里声明过的危险权限
+   一律 GRANTED」：直接复用已有的 getDangerousPermissions(pkgName) 表。
+   否则 HMS 自己的 PermissionUtils 先 checkSelfPermission 就被拒，根本不去取
+   IMEI，宿主给不给权限都没用。
+4. HmsProbe 增加 dev 探针：
+   TerminalInfo.isUDIDSupport / getSerialNo / getUUid / getUnitedId / getDeviceId
+   DeviceInfoUtil.getRegisterDeviceInfo -> id / id2 / id3 / idType / imsi(打码)
+5. 版本 2.6.44(164) -> 2.6.45(165)；app_name -> hush 2.6.45。
+
+【怎么验证】
+安装后首次打开 App 会弹「允许 hush 使用电话权限」，必须点允许。
+再点华为账号 -> 立即登录/注册，日志里应看到：
+  dev: TerminalInfo.isUDIDSupport -> true/false
+  dev: TerminalInfo.getSerialNo -> …
+  dev: TerminalInfo.getDeviceId -> 86xxxxxxxxxxxxx
+  dev: DeviceInfo id=… id2=… idType=8
+  hms: http … getSMSCodeV3 http=200
+如果 deviceID 仍是空串，说明这两条权限没给到：进系统设置 ->
+应用 -> hush 2.6.45 -> 权限 -> 电话 -> 允许，然后重试。
+
+
+== 2.6.46 ==
+【2.6.45 日志】
+权限确实给到了：
+  hms: telephony: permReadPhone=0 subscriberId=null networkType=13 …
+（从 -1 变成 0，subscriberId 也不再抛 SecurityException，只是返回 null）
+但服务端依然拒绝：
+  hms: http …/IdmClientApi/IDM/loginBySMS http=500
+       body={"errorCode":70001201,"errorDesc":"Parameter[deviceID]is invalid"}
+弹框链路也变了（说明请求确实发出去了）：
+  dlg: UIUtil.createCommonDialog(<ctx>, 0, "无法获取数据，请稍后再试。", false)
+       at pa.b(BaseShowRequestFailed.java:188)
+       at x9.dealRequestSucOrFail(Base20Activity.java:192)
+       at x9.showRequestFailedDialog(Base20Activity.java:38)
+
+【为什么还是空】
+Android 10 以后 IMEI/MEID 对非系统应用一律返回 null（getSubscriberId 也
+是 null，如其所示）；Build.getSerial() 多数机型返回 "unknown"。
+所以 DeviceInfoUtil.getRegisterDeviceInfo 走到：
+  deviceID = TerminalInfo.getUUid(context)
+getUUid 查 content://com.huawei.hwid.inner.provider 的 TAG_METHOD_QUERY_UUID，
+真机由系统 hwid 进程应答；容器里 com.huawei.hwid 是虚拟包，这条 provider
+拿不到值 -> ""（或 "NULL"）-> 服务端判 70001201。
+HMS 自己的兜底 y32.a() 也是「memcache 空就 randomUUID 并写回 provider」，
+同样卡在 provider 不可用。
+
+【2.6.46 改动】
+1. 新增 HushCore/src/main/java/com/hush/utils/HmsDeviceId.java：
+   挂 TerminalInfo.getUUid / getUUidPersistent(Context)。
+   返回值为空 / "NULL" / "unknown" / "null" 时，补一个容器内持久化的 UUID：
+   落在 guest 包 files/hush_hms_device_uuid，所有 HMS 子进程读同一个文件，
+   保证同一台容器里 deviceID 稳定一致。
+   同时只读日志挂在 getSerialNo / getDeviceId / getUnitedId 上，方便对照。
+2. StubLauncher.prewarm 对 kit CL 和 guest CL 两处都安装 HmsDeviceId。
+3. 版本 2.6.45(165) -> 2.6.46(166)；app_name -> hush 2.6.46。
+
+【怎么验证】点华为账号 -> 立即登录/注册，日志里应看到：
+  dev: TerminalInfo.getSerialNo -> unknown/…
+  dev: TerminalInfo.getUUid 原本为空，补 UUID 3f2a……-……
+  dev: TerminalInfo.getDeviceId -> null
+  hms: http … loginBySMS http=200
+deviceID 走 UUID 时服务端的 deviceType 是 6，只要格式是标准 UUID 就合法。
+
+
+== 2.6.47 ==
+【现象】点「登录」直接闪退（2.6.46 日志 20:07:18.797 / 20:07:34.756 反复出现）
+  FATAL proc=com.hush.space:p8
+  RuntimeException: Unable to bind to service com.hush.proxy.ProxyService$P8
+   Caused by: Unable to create service
+     com.huawei.hwid.manager.accountmgr.HwAccMgrService      (BActivityThread:213)
+   Caused by: ClassCastException:
+     com.huawei.hwid.manager.accountmgr.HwAccMgrService
+       cannot be cast to android.app.Service           (BActivityThread:204)
+p8 的宿主进程身份是 com.huawei.hms.account:remote（登录时首次拉起）。
+
+【根因】不是 ClassLoader 问题，是这个类本身就不是 Service。
+反编译继承链：
+  HwAccMgrService -> SafeService -> KitService -> KitContext
+    -> NonCrashKitContext -> android.content.Context
+runtimekit 的 KitService 是「虚拟服务」，只能由 ContainerService 代理，
+不能当普通 android.app.Service 实例化。真机上这个类只存在于
+AccountKit-base.apk，而 AccountKit 不会被装成一个独立包，验证器由
+com.huawei.hwid 清单里的
+  com.huawei.hms.runtimekit.stubexplicit.HwIDHwAccMgrService
+（真 Service，进程 com.huawei.hwid.container2，intent-filter
+android.accounts.AccountAuthenticator）提供。
+
+容器把 9 个 HMS 包各自安装后，BAccountManagerService 的
+loadAuthenticatorCache -> queryIntentServices(AccountAuthenticator) 会同时
+扫到 hwid 和 AccountKit 两份声明，后者（:remote）把前者在
+generateServicesMap 的 map 里覆盖掉，于是所有 AccountManager 操作都去 bind
+AccountKit 的虚拟服务 -> ActivityThread 里 (Service) newInstance -> CCE
+-> p8 整个进程崩 -> 登录闪退。
+
+【2.6.47 改动】BAccountManagerService.generateServicesMap：
+跳过 packageName 以 com.huawei.hms. 开头的服务声明，只保留 com.huawei.hwid
+（及其他真实应用）的 authenticator。绑定随之回到 HwIDHwAccMgrService，
+由 runtimekit 正常代理到 AccountKit 的 HwAccMgrService。
+
+【怎么验证】
+点「登录」，日志里不应再出现
+  Unable to create service ... HwAccMgrService / cannot be cast to android.app.Service
+并且能看到 hwid 的 container2 进程被拉起、账号校验请求
+  loginBySMS / getSMSCodeV3 返回 200。
+
+
+== 2.6.48 ==
+【2.6.47 日志】HwAccMgrService 的 CCE 已经没了（p8 不再崩），
+但登录链在 20:19:53.3 自己关掉退回框架：
+  act: destroy HwIDStartUpGuideLoginActivity finishing=true
+  act: destroy HuaweiIDForSettingsActivity finishing=true
+在此之前 OneKey(33.0) -> 短信页(34.6) -> LoginLoading(35.6)，之后 17 秒无任何
+"hms: http" 行，也就是没有任何登录请求发出。同时 p7 在
+  20:19:50.020 getUnitedId / getDeviceId
+  20:19:52.69  getUUid -> UUID / getUnitedId -> UUID
+  20:19:52.698 getUUid -> 另一个 UUID    ← 7ms 内两个不同值
+说明 HmsDeviceId 按 ctx.getFilesDir() 存盘，不同 guest 包各写一份，
+deviceID 在同一台容器里不唯一，服务端会当成不同设备。
+
+【2.6.48 改动】
+1. HmsDeviceId：UUID 固定落在 com.huawei.hwid 包的 files 目录
+   （BEnvironment.getDataFilesDir("com.huawei.hwid", 0)），并加进程内缓存，
+   所有 HMS 子进程（hwid / account / account.core）拿到同一个 deviceID。
+2. HmsProbe：新增 hookActivityExit —— 挂 framework 的
+   Activity.finish() 和 Activity.onBackPressed()，只记 com.huawei. 开头的页面，
+   打类名 + intent 里的真实组件 + 8 帧调用栈，前缀 "fin:"。
+   目的：直接看清是用户按返回、还是某个 usecase 自己 finish。
+3. 版本 2.6.47(167) -> 2.6.48(168)；app_name -> hush 2.6.48。
+
+【怎么验证】正常点一次「登录」直到退回框架，然后把日志里所有
+  fin: finish …            ← 谁调的 finish，栈里就是原因
+  fin: onBackPressed …     ← 如果是这类，说明是手动返回
+的行发回来。
